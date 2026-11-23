@@ -1,0 +1,13 @@
+# 构建产物（二进制不入库，分发包走 dist/）
+/relay-retry-proxy-linux-amd64
+/relay-retry-proxy-linux-arm64
+/relay-retry-proxy-windows-amd64.exe
+/bundle-win/
+*.bak
+*.bak-*
+*.log
+*.out
+.env
+.DS_Store
+# 打包中间目录（只提交最终压缩包）
+/dist/pkg/

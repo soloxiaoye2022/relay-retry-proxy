@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>relay-retry-proxy</title>
+<link rel="stylesheet" href="/assets/style.css">
+</head>
+<body>
+<div id="app">
+  <header>
+    <div class="brand">
+      <span class="dot" :class="health.ok ? 'ok' : 'bad'"></span>
+      <strong>relay-retry-proxy</strong>
+      <span class="ver">v{{ health.version }}</span>
+      <span class="up">运行 {{ uptimeText }}</span>
+    </div>
+    <div class="right">
+      <span class="sse" :class="sseState">{{ sseLabel }}</span>
+    </div>
+  </header>
+
+  <section class="cards">
+    <div class="card">
+      <div class="k">总请求</div>
+      <div class="v">{{ stats.total }}</div>
+    </div>
+    <div class="card">
+      <div class="k">成功</div>
+      <div class="v ok">{{ stats.succeeded }}</div>
+    </div>
+    <div class="card">
+      <div class="k">失败</div>
+      <div class="v" :class="stats.failed ? 'bad' : ''">{{ stats.failed }}</div>
+    </div>
+    <div class="card">
+      <div class="k">重试/对冲</div>
+      <div class="v warn">{{ stats.retried }}</div>
+    </div>
+    <div class="card">
+      <div class="k">上游 5xx</div>
+      <div class="v warn">{{ stats.upstream5xx }}</div>
+    </div>
+    <div class="card">
+      <div class="k">成功率</div>
+      <div class="v">{{ successRate }}</div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <h2>上游</h2>
+    <div class="chips">
+      <span class="chip" v-for="u in health.upstreams" :key="u">{{ u }}</span>
+    </div>
+    <div class="cfg">
+      <span>attempts <b>{{ cfg.max_attempts }}</b></span>
+      <span>hedge <b>{{ cfg.hedge_after }}</b></span>
+      <span>head-timeout <b>{{ cfg.head_timeout }}</b></span>
+      <span>dial-timeout <b>{{ cfg.dial_timeout }}</b></span>
+      <span>base-delay <b>{{ cfg.base_delay }}</b></span>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
+      <h2>最近请求 <span class="muted">({{ requests.length }})</span></h2>
+      <div class="tools">
+        <input v-model="filter" placeholder="过滤 path / 状态 / id">
+        <label class="ck"><input type="checkbox" v-model="onlyIssues"> 只看重试/失败</label>
+        <button @click="clearLocal">清空显示</button>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>时间</th><th>ID</th><th>路径</th><th>尝试</th><th>状态</th>
+            <th>字节</th><th>耗时</th><th>备注</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr v-for="r in filtered" :key="r.seq" :class="rowClass(r)">
+            <td class="mono">{{ r.time }}</td>
+            <td class="mono">{{ r.id }}</td>
+            <td class="mono">{{ r.path }}</td>
+            <td class="mono center">{{ r.attempt }}</td>
+            <td class="mono center">
+              <span class="badge" :class="statusClass(r.status)">{{ r.status || '—' }}</span>
+            </td>
+            <td class="mono right">{{ fmtBytes(r.bytes) }}</td>
+            <td class="mono right">{{ fmtDur(r.duration_ms) }}</td>
+            <td class="note">{{ r.note }}</td>
+          </tr>
+          <tr v-if="filtered.length === 0">
+            <td colspan="8" class="empty">暂无请求</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+  <footer>数据来自本机代理进程，SSE 实时推送；页面每 5 秒兜底刷新一次。</footer>
+</div>
+<script src="/assets/vue.global.prod.js"></script>
+<script src="/assets/app.js"></script>
+</body>
+</html>
