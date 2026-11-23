@@ -11,3 +11,6 @@
 .DS_Store
 # 打包中间目录（只提交最终压缩包）
 /dist/pkg/
+# 工具运行时目录（gh 等）
+.config/
+.local/
