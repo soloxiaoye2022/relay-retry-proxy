@@ -21,17 +21,19 @@ var startedAt = time.Now()
 
 // RequestRecord 是写到 UI 上的一行记录。
 type RequestRecord struct {
-	Seq        int64  `json:"seq"`
-	Time       string `json:"time"`
-	ID         string `json:"id"`
-	Method     string `json:"method"`
-	Path       string `json:"path"`
-	Attempt    int    `json:"attempt"`
-	Status     int    `json:"status"`
-	Bytes      int64  `json:"bytes"`
-	DurationMs int64  `json:"duration_ms"`
-	Note       string `json:"note"`
-	Error      string `json:"error,omitempty"`
+	Seq          int64  `json:"seq"`
+	Time         string `json:"time"`
+	ID           string `json:"id"`
+	Method       string `json:"method"`
+	Path         string `json:"path"`
+	Attempt      int    `json:"attempt"`
+	Status       int    `json:"status"`
+	Bytes        int64  `json:"bytes"`
+	DurationMs   int64  `json:"duration_ms"`
+	Note         string `json:"note"`
+	Error        string `json:"error,omitempty"`
+	RequestDump  string `json:"request_dump,omitempty"`
+	ResponseDump string `json:"response_dump,omitempty"`
 }
 
 type ring struct {
@@ -119,7 +121,16 @@ var (
 	uiHub  = newHub()
 )
 
+var (
+	dumpCounter int64
+	dumpDirCfg  string
+	dumpKeepCfg int
+)
+
 func recordRequest(rec RequestRecord) {
+	if dumpDirCfg != "" && atomic.AddInt64(&dumpCounter, 1)%25 == 0 {
+		pruneDumps(dumpDirCfg, dumpKeepCfg)
+	}
 	saved := reqLog.push(rec)
 	uiHub.broadcast("record", saved)
 	uiHub.broadcast("stats", statsSnapshot())

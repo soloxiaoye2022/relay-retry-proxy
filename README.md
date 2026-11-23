@@ -159,6 +159,39 @@ ADMIN_LISTEN=127.0.0.1:9090,YOUR-SERVER-IP:9090
 
 然后 Windows 浏览器访问 `http://YOUR-SERVER-IP:9090/ui`。
 
+
+## 断流排查：dump 落盘
+
+怀疑"回答做一半停了"时，打开 dump 就能分清是**上游提前结束**还是**客户端/代理截断**：
+
+```ini
+DUMP_DIR=/var/log/relay-retry-proxy/dumps
+DUMP_MAX_KB=2048     # 单个文件上限
+DUMP_KEEP=200        # 每个方向保留多少个文件（自动轮转）
+DUMP_BODY=0          # 1=请求体也落盘（默认 0，避免把 prompt 写进磁盘）
+```
+
+或者命令行：`-dump-dir /path -dump-max-kb 2048 -dump-keep 200 -dump-body=false`
+
+每次请求生成两个文件（`0600`，目录 `0700`）：
+
+```
+20261123-231540.296-O9cTJd0JmZ-req.txt    请求行、脱敏后的头、body（默认省略）
+20261123-231545.108-O9cTJd0JmZ-resp.txt   响应原文尾部（含 SSE 分片），到上限截断
+```
+
+分辨方法：
+
+| 现象 | 结论 |
+|---|---|
+| `resp.txt` 里能看到 `finish_reason` / `[DONE]` / 完整结尾 | 上游正常结束，停是客户端/agent 行为 |
+| `resp.txt` 中途被切断，且日志有 `client gone` | 客户端断开（Trae 自己放弃） |
+| `resp.txt` 为空且日志有 `gave up` | 上游确实失败，重试也救不回 |
+
+脱敏规则：任何名字里含 `authorization` / `token` / `auth` / `key` / `cookie` / `secret` /
+`session` / `credential` 的请求头一律打成 `***REDACTED***`；`X-Forwarded-For`、`X-Real-IP`
+也打码；请求体默认不落盘。
+
 ## 配置文件
 
 可执行文件同目录放一个 `relay-retry-proxy.env`，启动时自动读取（不用带任何参数）：

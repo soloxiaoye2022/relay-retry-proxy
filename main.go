@@ -42,6 +42,10 @@ type config struct {
 	dialTimeout time.Duration
 	hedgeAfter  time.Duration
 	adminListen string
+	dumpDir     string
+	dumpMax     int64
+	dumpKeep    int
+	dumpBody    bool
 	logPath     string
 	maxBody     int64
 }
@@ -68,6 +72,7 @@ func main() {
 		log.SetOutput(f)
 	}
 
+	dumpDirCfg, dumpKeepCfg = cfg.dumpDir, cfg.dumpKeep
 	client := newHTTPClient(cfg)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/__health", func(w http.ResponseWriter, r *http.Request) {
@@ -97,8 +102,8 @@ func main() {
 	startAdminServers(cfg)
 
 	go func() {
-		log.Printf("[start] listen=%s upstreams=%s attempts=%d base=%s max=%s headTimeout=%s dialTimeout=%s hedgeAfter=%s",
-			cfg.listen, strings.Join(cfg.upstreams, ","), cfg.maxAttempts, cfg.baseDelay, cfg.maxDelay, cfg.headTimeout, cfg.dialTimeout, cfg.hedgeAfter)
+		log.Printf("[start] listen=%s upstreams=%s attempts=%d base=%s max=%s headTimeout=%s dialTimeout=%s hedgeAfter=%s dumpDir=%s",
+			cfg.listen, strings.Join(cfg.upstreams, ","), cfg.maxAttempts, cfg.baseDelay, cfg.maxDelay, cfg.headTimeout, cfg.dialTimeout, cfg.hedgeAfter, cfg.dumpDir)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatalf("listen: %v", err)
 		}
@@ -123,6 +128,10 @@ func parseFlags() config {
 		configPath = flag.String("config", "", "配置文件路径（默认同目录 relay-retry-proxy.env）")
 		showVer    = flag.Bool("version", false, "打印版本后退出")
 		adminAddr  = flag.String("admin-listen", "127.0.0.1:9090", "WebUI 监听地址，逗号分隔可多个；0 或空=不启用")
+		dumpDir    = flag.String("dump-dir", "", "把请求/响应尾部落盘到该目录（空=不落盘），用于排查断流")
+		dumpMaxKB  = flag.Int64("dump-max-kb", 2048, "单个 dump 文件上限（KB）")
+		dumpKeep   = flag.Int("dump-keep", 400, "每个方向保留的文件数")
+		dumpBody   = flag.Bool("dump-body", false, "dump 里是否包含请求体（默认 false，避免落盘 prompt）")
 		listen     = flag.String("listen", "127.0.0.1:8443", "监听地址")
 		upstreams  = flag.String("upstream", "http://127.0.0.1:4000", "上游 base URL，逗号分隔可配多个做故障切换")
 		maxAtt     = flag.Int("max-attempts", 5, "最大尝试次数（含首次）")
@@ -200,6 +209,13 @@ func parseFlags() config {
 	cfg.dialTimeout = parseDur(pick("DIAL_TIMEOUT", dialTO.String(), explicit["dial-timeout"]), 10*time.Second)
 	cfg.hedgeAfter = parseDur(pick("HEDGE_AFTER", hedgeTO.String(), explicit["hedge-after"]), 8*time.Second)
 	cfg.adminListen = pick("ADMIN_LISTEN", *adminAddr, explicit["admin-listen"])
+	cfg.dumpDir = pick("DUMP_DIR", *dumpDir, explicit["dump-dir"])
+	cfg.dumpMax = int64(parseInt(pick("DUMP_MAX_KB", strconv.FormatInt(*dumpMaxKB, 10), explicit["dump-max-kb"]), 2048)) << 10
+	cfg.dumpKeep = parseInt(pick("DUMP_KEEP", strconv.Itoa(*dumpKeep), explicit["dump-keep"]), 400)
+	cfg.dumpBody = *dumpBody
+	if v, ok := kv["DUMP_BODY"]; ok && !explicit["dump-body"] {
+		cfg.dumpBody = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+	}
 	cfg.logPath = pick("LOG", *logPath, explicit["log"])
 	cfg.maxBody = int64(parseInt(pick("MAX_BODY_MB", strconv.FormatInt(*maxBodyMB, 10), explicit["max-body-mb"]), 64)) << 20
 	if cfg.configFile != "" {
@@ -257,6 +273,9 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 		ID:     reqID,
 		Method: r.Method,
 		Path:   r.URL.Path,
+	}
+	if cfg.dumpDir != "" {
+		rec.RequestDump = writeRequestDump(cfg.dumpDir, reqID, r.Method, r.URL.Path, r.Header, body, cfg.dumpMax, cfg.dumpBody)
 	}
 	hedgedAt := 0
 	defer func() {
@@ -361,8 +380,12 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 			copyHeaders(w.Header(), res.resp.Header)
 			w.Header().Set("X-Proxy-Attempt", strconv.Itoa(res.attempt))
 			w.WriteHeader(res.resp.StatusCode)
-			n, copyErr := streamCopy(w, res.resp.Body)
+			sink := newDumpSink(cfg.dumpDir, reqID, cfg.dumpMax)
+			n, copyErr := streamCopy(w, res.resp.Body, sink)
 			_ = res.resp.Body.Close()
+			if sink != nil {
+				rec.ResponseDump = sink.Close()
+			}
 			st.succeeded.Add(1)
 			rec.Attempt = res.attempt
 			rec.Status = res.resp.StatusCode
@@ -418,7 +441,7 @@ func fail(w http.ResponseWriter, reqID string, start time.Time, lastErr string, 
 }
 
 // streamCopy 边读边写，每块都 flush，保证 SSE 实时到达客户端。
-func streamCopy(w http.ResponseWriter, src io.Reader) (int64, error) {
+func streamCopy(w http.ResponseWriter, src io.Reader, sink *dumpSink) (int64, error) {
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 16*1024)
 	var total int64
@@ -429,6 +452,9 @@ func streamCopy(w http.ResponseWriter, src io.Reader) (int64, error) {
 				return total, werr
 			}
 			total += int64(n)
+			if sink != nil {
+				_, _ = sink.Write(buf[:n])
+			}
 			if flusher != nil {
 				flusher.Flush()
 			}
