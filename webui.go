@@ -37,6 +37,10 @@ type RequestRecord struct {
 	OutTokens    int64   `json:"out_tokens"`
 	TPS          float64 `json:"tps"`
 	TokensEst    bool    `json:"tokens_estimated,omitempty"`
+	TTFTMs       int64   `json:"ttft_ms,omitempty"`
+	GenTPS       float64 `json:"gen_tps,omitempty"`
+	CachedTokens int64   `json:"cached_tokens,omitempty"`
+	ReasonTokens int64   `json:"reasoning_tokens,omitempty"`
 	RequestDump  string  `json:"request_dump,omitempty"`
 	ResponseDump string  `json:"response_dump,omitempty"`
 }

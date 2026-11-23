@@ -208,7 +208,17 @@ DUMP_BODY=0          # 1=请求体也落盘（默认 0，避免把 prompt 写进
 2. **上游没给 usage 时按字节估算**：约 3 字节/token，记录里标 `est:true`，看板显示"其中 N 条为估算"。
 3. **4xx/5xx 不计 token**：错误响应体不是模型输出。
 
-速度：`tok/s = output_tokens / (请求总耗时秒)`，按请求算，聚合时按总输出/总耗时算均速。
+**速度指标（两套口径）**
+
+| 指标 | 算法 | 用途 |
+|---|---|---|
+| `tok/s`（总） | output_tokens ÷ 整个请求耗时 | 端到端体验 |
+| `gen_tps`（生成） | output_tokens ÷ (耗时 − TTFT) | 模型真实吐字速度 |
+| `TTFT` | 从发起请求到**首个响应字节**到达的毫秒数 | 反映 prefill 有多慢 |
+| 实时 tok/s | 在途请求每 700ms 推一次：已收估算 tokens ÷ 已用时间 | 看板顶部实时条 |
+
+`cached_tokens`（prompt 缓存命中）与 `reasoning_tokens`（思考 token）也会从
+`prompt_tokens_details` / `completion_tokens_details` 里解析并落盘。
 
 持久化：默认写在日志目录下的 `usage/usage-YYYY-MM-DD.jsonl`（每天一个文件，`0600`）：
 

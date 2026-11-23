@@ -10,6 +10,7 @@ createApp({
                         models: [], hourly: [], day: '', storage: '' });
     const requests = ref([]);
     const filter = ref('');
+    const live = ref(null);
     const onlyIssues = ref(false);
     const sseState = ref('dead');
     let es = null, tick = null, uptimeTick = null, seq = 0;
@@ -109,6 +110,13 @@ createApp({
       es.addEventListener('usage', ev => {
         try { usage.value = JSON.parse(ev.data); } catch (e) {}
       });
+      es.addEventListener('progress', ev => {
+        try {
+          const p = JSON.parse(ev.data);
+          if (p.done) { if (live.value && live.value.id === p.id) live.value = null; }
+          else { live.value = p; }
+        } catch (e) {}
+      });
       es.addEventListener('error', () => {
         sseState.value = 'dead';
         es.close();
@@ -135,7 +143,7 @@ createApp({
 
     return {
       health, stats, cfg, requests, filter, onlyIssues, sseState, sseLabel,
-      usage, fmtNum, fmtTps, barH,
+      usage, live, fmtNum, fmtTps, barH,
       successRate, uptimeText, filtered, fmtBytes, fmtDur, statusClass, rowClass, clearLocal,
     };
   },

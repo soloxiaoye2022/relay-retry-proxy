@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -26,6 +27,10 @@ type UsageRecord struct {
 	TPS     float64 `json:"tps"`
 	Est     bool    `json:"est,omitempty"` // true = 上游没给 usage，按字节估算
 	Retries int     `json:"retries,omitempty"`
+	TTFTMs  int64   `json:"ttft_ms,omitempty"` // 首字节/首个 token 时间
+	GenTPS  float64 `json:"gen_tps,omitempty"` // 纯生成阶段 tok/s（扣掉 TTFT）
+	Cached  int64   `json:"cached_tokens,omitempty"`
+	Reason  int64   `json:"reasoning_tokens,omitempty"`
 }
 
 type bucket struct {
@@ -36,6 +41,11 @@ type bucket struct {
 	DurMs   int64 `json:"dur_ms"`
 	Errors  int64 `json:"errors"`
 	EstReqs int64 `json:"est_reqs"`
+	TTFTSum int64 `json:"ttft_ms_sum"`
+	GenOut  int64 `json:"gen_out"` // 用于算生成阶段均速
+	GenMs   int64 `json:"gen_ms"`
+	Cached  int64 `json:"cached"`
+	Reason  int64 `json:"reasoning"`
 }
 
 func (b *bucket) add(r UsageRecord) {
@@ -49,6 +59,15 @@ func (b *bucket) add(r UsageRecord) {
 	}
 	if r.Est {
 		b.EstReqs++
+	}
+	b.Cached += r.Cached
+	b.Reason += r.Reason
+	if r.TTFTMs > 0 {
+		b.TTFTSum += r.TTFTMs
+	}
+	if r.GenTPS > 0 && r.Out > 0 {
+		b.GenOut += r.Out
+		b.GenMs += int64(float64(r.Out) / r.GenTPS * 1000)
 	}
 }
 
@@ -175,6 +194,20 @@ func (s *UsageStore) Add(r UsageRecord) {
 	s.applyLocked(r, time.Now().Format("2006-01-02"))
 }
 
+func (b bucket) ttft() float64 {
+	if b.Reqs == 0 {
+		return 0
+	}
+	return float64(b.TTFTSum) / float64(b.Reqs)
+}
+
+func (b bucket) genTps() float64 {
+	if b.GenMs <= 0 {
+		return 0
+	}
+	return float64(b.GenOut) / (float64(b.GenMs) / 1000.0)
+}
+
 func (b bucket) tps() float64 {
 	if b.DurMs <= 0 {
 		return 0
@@ -227,11 +260,15 @@ func (s *UsageStore) Summary() map[string]any {
 			"in": s.todayB.In, "out": s.todayB.Out, "total": s.todayB.Total,
 			"reqs": s.todayB.Reqs, "errors": s.todayB.Errors,
 			"tps": s.todayB.tps(), "est_reqs": s.todayB.EstReqs,
+			"gen_tps": s.todayB.genTps(), "ttft_ms": s.todayB.ttft(),
+			"cached": s.todayB.Cached, "reasoning": s.todayB.Reason,
 		},
 		"total": map[string]any{
 			"in": s.totalB.In, "out": s.totalB.Out, "total": s.totalB.Total,
 			"reqs": s.totalB.Reqs, "errors": s.totalB.Errors,
 			"tps": s.totalB.tps(), "est_reqs": s.totalB.EstReqs,
+			"gen_tps": s.totalB.genTps(), "ttft_ms": s.totalB.ttft(),
+			"cached": s.totalB.Cached, "reasoning": s.totalB.Reason,
 		},
 		"models":  models,
 		"hourly":  series,
@@ -256,25 +293,36 @@ func (s *UsageStore) Close() {
 
 // ---------- 从响应流里抽取 usage ----------
 
-// tailBuf 只保留最后 N 字节，用来找结尾处的 usage 对象。
+// tailBuf 只保留最后 N 字节用于找 usage，同时累计总字节、首个数据到达时刻与估算 token 数。
 type tailBuf struct {
-	buf []byte
-	max int
+	buf     []byte
+	max     int
+	total   int64
+	estTok  int64
+	firstAt int64 // unix nano，0 表示还没收到数据
 }
 
 func newTailBuf(max int) *tailBuf { return &tailBuf{max: max} }
 
 func (t *tailBuf) Write(p []byte) (int, error) {
+	if atomic.LoadInt64(&t.firstAt) == 0 {
+		atomic.StoreInt64(&t.firstAt, time.Now().UnixNano())
+	}
 	t.buf = append(t.buf, p...)
 	if len(t.buf) > t.max {
 		t.buf = t.buf[len(t.buf)-t.max:]
 	}
+	atomic.AddInt64(&t.total, int64(len(p)))
+	atomic.AddInt64(&t.estTok, estimateTokensFromBytes(p))
 	return len(p), nil
 }
 
 // parseUsage 在响应尾部里找最后一个可解析的 usage 对象。
 // 兼容 chat/completions 的 prompt_tokens/completion_tokens 与 responses 的 input_tokens/output_tokens。
+var lastCached, lastReason int64
+
 func parseUsage(b []byte) (in, out, total int64, ok bool) {
+	lastCached, lastReason = 0, 0
 	for i := len(b) - 1; i >= 0; i-- {
 		if i > 0 && !(b[i] == '"' && i+7 < len(b) && string(b[i:i+7]) == `"usage"`) {
 			continue
@@ -307,20 +355,42 @@ func parseUsage(b []byte) (in, out, total int64, ok bool) {
 		in = pick("input_tokens", "prompt_tokens")
 		out = pick("output_tokens", "completion_tokens")
 		total = pick("total_tokens")
+		var cached, reasoning int64
+		if pd, ok := u["prompt_tokens_details"].(map[string]any); ok {
+			if v, ok := pd["cached_tokens"].(float64); ok {
+				cached = int64(v)
+			}
+		}
+		if cd, ok := u["completion_tokens_details"].(map[string]any); ok {
+			if v, ok := cd["reasoning_tokens"].(float64); ok {
+				reasoning = int64(v)
+			}
+		}
 		if in == 0 && out == 0 {
 			continue
 		}
 		if total == 0 {
 			total = in + out
 		}
+		lastCached, lastReason = cached, reasoning
 		return in, out, total, true
 	}
 	return 0, 0, 0, false
 }
 
-// estimateTokens 上游没给 usage 时按字节粗估：ASCII 约 4 字节/token，CJK 约 1.6 字节/token。
-func estimateTokens(in, out int64) (int64, int64) {
-	return in / 3, out / 3
+// estimateTokens 上游没给 usage 时的兜底估算：
+// 先用字节数算一个上界，再按"非 ASCII 字符单独计 1 token"的思路修正。
+func estimateTokensFromBytes(b []byte) int64 {
+	var ascii, wide int64
+	for _, r := range string(b) {
+		if r < 128 {
+			ascii++
+		} else {
+			wide++
+		}
+	}
+	// ASCII 约 4 字节/token；CJK 等宽字符约 1 字/token
+	return ascii/4 + wide
 }
 
 // extractModel 从请求体里取 model 字段。

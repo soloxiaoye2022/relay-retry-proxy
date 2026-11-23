@@ -422,7 +422,10 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 			w.WriteHeader(res.resp.StatusCode)
 			sink := newDumpSink(cfg.dumpDir, reqID, cfg.dumpMax)
 			tap := newTailBuf(256 << 10)
+			stopMon := make(chan struct{})
+			go monitorProgress(reqID, tap, start, stopMon)
 			n, copyErr := streamCopy(w, res.resp.Body, sink, tap)
+			close(stopMon)
 			_ = res.resp.Body.Close()
 			if sink != nil {
 				rec.ResponseDump = sink.Close()
@@ -434,7 +437,8 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 			if res.resp.StatusCode >= 400 {
 				inTok, outTok, totTok, hasUsage = 0, 0, 0, true
 			} else if !hasUsage {
-				inTok, outTok = estimateTokens(int64(len(body)), n)
+				inTok = estimateTokensFromBytes(body)
+				outTok = atomic.LoadInt64(&tap.estTok)
 				totTok = inTok + outTok
 				est = true
 			}
@@ -443,6 +447,19 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 			if outTok > 0 && durMs > 0 {
 				tps = float64(outTok) / (float64(durMs) / 1000.0)
 			}
+			ttftMs := int64(0)
+			if fa := atomic.LoadInt64(&tap.firstAt); fa > 0 {
+				ttftMs = (fa - start.UnixNano()) / 1e6
+			}
+			genMs := durMs - ttftMs
+			genTps := 0.0
+			if outTok > 0 && genMs > 0 {
+				genTps = float64(outTok) / (float64(genMs) / 1000.0)
+			}
+			rec.TTFTMs = ttftMs
+			rec.GenTPS = genTps
+			rec.CachedTokens = lastCached
+			rec.ReasonTokens = lastReason
 			rec.Model = model
 			rec.InTokens = inTok
 			rec.OutTokens = outTok
@@ -452,6 +469,7 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 				Ts: time.Now().Unix(), ID: reqID, Path: r.URL.Path, Model: model,
 				Status: res.resp.StatusCode, In: inTok, Out: outTok, Total: totTok,
 				DurMs: durMs, TPS: tps, Est: est, Retries: res.attempt - 1,
+				TTFTMs: ttftMs, GenTPS: genTps, Cached: lastCached, Reason: lastReason,
 			})
 			rec.Attempt = res.attempt
 			rec.Status = res.resp.StatusCode
@@ -652,4 +670,31 @@ func loadEnvFile(path string) map[string]string {
 		kv[strings.ToUpper(strings.TrimSpace(k))] = strings.Trim(strings.TrimSpace(v), `"'`)
 	}
 	return kv
+}
+
+// monitorProgress 每 700ms 把在途请求的估算速度推给 WebUI，实现"实时 tok/s"。
+func monitorProgress(reqID string, tap *tailBuf, start time.Time, stop <-chan struct{}) {
+	tk := time.NewTicker(700 * time.Millisecond)
+	defer tk.Stop()
+	for {
+		select {
+		case <-stop:
+			uiHub.broadcast("progress", map[string]any{
+				"id": reqID, "done": true, "elapsed_ms": time.Since(start).Milliseconds(),
+				"bytes": atomic.LoadInt64(&tap.total),
+			})
+			return
+		case <-tk.C:
+			elapsed := time.Since(start).Milliseconds()
+			tok := atomic.LoadInt64(&tap.estTok)
+			tps := 0.0
+			if elapsed > 0 {
+				tps = float64(tok) / (float64(elapsed) / 1000.0)
+			}
+			uiHub.broadcast("progress", map[string]any{
+				"id": reqID, "done": false, "elapsed_ms": elapsed,
+				"bytes": atomic.LoadInt64(&tap.total), "tokens": tok, "tps": tps,
+			})
+		}
+	}
 }

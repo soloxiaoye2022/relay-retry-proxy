@@ -69,3 +69,6 @@ table.mini{font-size:12px}
 .bar-item{flex:1;display:flex;flex-direction:column;justify-content:flex-end;align-items:center;height:100%}
 .bar{width:100%;background:linear-gradient(180deg,#2f81f7,#1f6feb55);border-radius:2px 2px 0 0;min-height:2px}
 .bar-x{font-size:9px;color:var(--dim);margin-top:3px;font-family:ui-monospace,monospace}
+.live-strip{display:flex;gap:14px;align-items:center;flex-wrap:wrap;
+  border-color:#1f6feb55;background:linear-gradient(90deg,#0d1b2a,#161b22);font-size:12.5px}
+.live-strip b{color:var(--fg)}
