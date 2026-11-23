@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-const version = "1.2.0"
+const version = "1.3.2"
 
 // shutdownGrace 与应用层一致：给在途流式请求留足时间，避免重启把用户请求打断
 const shutdownGrace = 150 * time.Second
@@ -46,6 +46,7 @@ type config struct {
 	dumpMax     int64
 	dumpKeep    int
 	dumpBody    bool
+	usageDir    string
 	logPath     string
 	maxBody     int64
 }
@@ -73,6 +74,9 @@ func main() {
 	}
 
 	dumpDirCfg, dumpKeepCfg = cfg.dumpDir, cfg.dumpKeep
+	usageStore = newUsageStore(cfg.usageDir)
+	defer usageStore.Close()
+	log.Printf("[usage] 持久化目录 %s（已恢复历史 %d 条聚合）", cfg.usageDir, usageStore.totalB.Reqs)
 	client := newHTTPClient(cfg)
 	mux := http.NewServeMux()
 	mux.HandleFunc("/__health", func(w http.ResponseWriter, r *http.Request) {
@@ -132,6 +136,7 @@ func parseFlags() config {
 		dumpMaxKB  = flag.Int64("dump-max-kb", 2048, "单个 dump 文件上限（KB）")
 		dumpKeep   = flag.Int("dump-keep", 400, "每个方向保留的文件数")
 		dumpBody   = flag.Bool("dump-body", false, "dump 里是否包含请求体（默认 false，避免落盘 prompt）")
+		usageDir   = flag.String("usage-dir", "", "用量数据持久化目录（默认：日志目录下的 usage/）")
 		listen     = flag.String("listen", "127.0.0.1:8443", "监听地址")
 		upstreams  = flag.String("upstream", "http://127.0.0.1:4000", "上游 base URL，逗号分隔可配多个做故障切换")
 		maxAtt     = flag.Int("max-attempts", 5, "最大尝试次数（含首次）")
@@ -217,6 +222,14 @@ func parseFlags() config {
 		cfg.dumpBody = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
 	}
 	cfg.logPath = pick("LOG", *logPath, explicit["log"])
+	cfg.usageDir = pick("USAGE_DIR", *usageDir, explicit["usage-dir"])
+	if cfg.usageDir == "" {
+		base := filepath.Dir(cfg.logPath)
+		if cfg.logPath == "" {
+			base = "."
+		}
+		cfg.usageDir = filepath.Join(base, "usage")
+	}
 	cfg.maxBody = int64(parseInt(pick("MAX_BODY_MB", strconv.FormatInt(*maxBodyMB, 10), explicit["max-body-mb"]), 64)) << 20
 	if cfg.configFile != "" {
 		log.Printf("[config] 使用配置文件 %s", cfg.configFile)
@@ -267,6 +280,8 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 		resp    *http.Response
 		err     error
 	}
+
+	model := extractModel(body)
 
 	rec := RequestRecord{
 		Time:   time.Now().Format("2006-01-02 15:04:05"),
@@ -325,6 +340,23 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 
 	launch()
 
+	var (
+		retryTimer *time.Timer
+		retryC     <-chan time.Time
+	)
+	scheduleRetry := func(d time.Duration) {
+		if retryTimer != nil {
+			retryTimer.Stop()
+		}
+		retryTimer = time.NewTimer(d)
+		retryC = retryTimer.C
+	}
+	defer func() {
+		if retryTimer != nil {
+			retryTimer.Stop()
+		}
+	}()
+
 	var timer *time.Timer
 	var hedgeC <-chan time.Time
 	if cfg.hedgeAfter > 0 {
@@ -342,11 +374,14 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 					return
 				}
 				lastErr = res.err.Error()
-				log.Printf("[%s] attempt %d failed: %v", reqID, res.attempt, res.err)
-				if !launch() {
+				if nextAttempt >= cfg.maxAttempts {
+					log.Printf("[%s] attempt %d failed: %v （已用尽尝试次数）", reqID, res.attempt, res.err)
 					fail(w, reqID, start, lastErr, &rec)
 					return
 				}
+				d := backoff(cfg, res.attempt)
+				log.Printf("[%s] attempt %d failed: %v → %s 后重试", reqID, res.attempt, res.err, d)
+				scheduleRetry(d)
 				continue
 			}
 
@@ -356,21 +391,26 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 				_ = res.resp.Body.Close()
 				lastErr = fmt.Sprintf("upstream %d: %s", res.resp.StatusCode, truncate(string(snippet), 300))
 				log.Printf("[%s] attempt %d got %s", reqID, res.attempt, lastErr)
-				if !launch() {
+				if nextAttempt >= cfg.maxAttempts {
 					copyHeaders(w.Header(), res.resp.Header)
 					w.Header().Set("X-Proxy-Attempt", strconv.Itoa(res.attempt))
 					w.WriteHeader(res.resp.StatusCode)
 					_, _ = w.Write(snippet)
 					st.failed.Add(1)
+					uiHub.broadcast("usage", usageStore.Summary())
 					rec.Attempt = res.attempt
 					rec.Status = res.resp.StatusCode
 					rec.Note = "upstream 5xx (耗尽尝试)"
 					rec.Error = lastErr
 					return
 				}
+				scheduleRetry(backoff(cfg, res.attempt))
 				continue
 			}
 
+			if retryTimer != nil {
+				retryTimer.Stop()
+			}
 			// 拿到有效响应：取消同批次其它尝试，开始流式透传
 			for a, c := range cancels {
 				if a != res.attempt {
@@ -381,12 +421,38 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 			w.Header().Set("X-Proxy-Attempt", strconv.Itoa(res.attempt))
 			w.WriteHeader(res.resp.StatusCode)
 			sink := newDumpSink(cfg.dumpDir, reqID, cfg.dumpMax)
-			n, copyErr := streamCopy(w, res.resp.Body, sink)
+			tap := newTailBuf(256 << 10)
+			n, copyErr := streamCopy(w, res.resp.Body, sink, tap)
 			_ = res.resp.Body.Close()
 			if sink != nil {
 				rec.ResponseDump = sink.Close()
 			}
 			st.succeeded.Add(1)
+			inTok, outTok, totTok, hasUsage := parseUsage(tap.buf)
+			est := false
+			// 4xx/5xx 的响应体是错误信息，不是模型输出，不计 token
+			if res.resp.StatusCode >= 400 {
+				inTok, outTok, totTok, hasUsage = 0, 0, 0, true
+			} else if !hasUsage {
+				inTok, outTok = estimateTokens(int64(len(body)), n)
+				totTok = inTok + outTok
+				est = true
+			}
+			durMs := time.Since(start).Milliseconds()
+			tps := 0.0
+			if outTok > 0 && durMs > 0 {
+				tps = float64(outTok) / (float64(durMs) / 1000.0)
+			}
+			rec.Model = model
+			rec.InTokens = inTok
+			rec.OutTokens = outTok
+			rec.TPS = tps
+			rec.TokensEst = est
+			usageStore.Add(UsageRecord{
+				Ts: time.Now().Unix(), ID: reqID, Path: r.URL.Path, Model: model,
+				Status: res.resp.StatusCode, In: inTok, Out: outTok, Total: totTok,
+				DurMs: durMs, TPS: tps, Est: est, Retries: res.attempt - 1,
+			})
 			rec.Attempt = res.attempt
 			rec.Status = res.resp.StatusCode
 			rec.Bytes = n
@@ -401,6 +467,15 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 			log.Printf("[%s] ok attempt=%d status=%d bytes=%d dur=%s copyErr=%v",
 				reqID, res.attempt, res.resp.StatusCode, n, time.Since(start).Round(time.Millisecond), copyErr)
 			return
+
+		case <-retryC:
+			retryC = nil
+			if rootCtx.Err() != nil {
+				return
+			}
+			if launch() {
+				log.Printf("[%s] 退避结束，发起 attempt %d/%d", reqID, nextAttempt, cfg.maxAttempts)
+			}
 
 		case <-hedgeC:
 			if rootCtx.Err() != nil {
@@ -441,7 +516,7 @@ func fail(w http.ResponseWriter, reqID string, start time.Time, lastErr string, 
 }
 
 // streamCopy 边读边写，每块都 flush，保证 SSE 实时到达客户端。
-func streamCopy(w http.ResponseWriter, src io.Reader, sink *dumpSink) (int64, error) {
+func streamCopy(w http.ResponseWriter, src io.Reader, sink *dumpSink, tap *tailBuf) (int64, error) {
 	flusher, _ := w.(http.Flusher)
 	buf := make([]byte, 16*1024)
 	var total int64
@@ -454,6 +529,9 @@ func streamCopy(w http.ResponseWriter, src io.Reader, sink *dumpSink) (int64, er
 			total += int64(n)
 			if sink != nil {
 				_, _ = sink.Write(buf[:n])
+			}
+			if tap != nil {
+				_, _ = tap.Write(buf[:n])
 			}
 			if flusher != nil {
 				flusher.Flush()

@@ -21,19 +21,24 @@ var startedAt = time.Now()
 
 // RequestRecord 是写到 UI 上的一行记录。
 type RequestRecord struct {
-	Seq          int64  `json:"seq"`
-	Time         string `json:"time"`
-	ID           string `json:"id"`
-	Method       string `json:"method"`
-	Path         string `json:"path"`
-	Attempt      int    `json:"attempt"`
-	Status       int    `json:"status"`
-	Bytes        int64  `json:"bytes"`
-	DurationMs   int64  `json:"duration_ms"`
-	Note         string `json:"note"`
-	Error        string `json:"error,omitempty"`
-	RequestDump  string `json:"request_dump,omitempty"`
-	ResponseDump string `json:"response_dump,omitempty"`
+	Seq          int64   `json:"seq"`
+	Time         string  `json:"time"`
+	ID           string  `json:"id"`
+	Method       string  `json:"method"`
+	Path         string  `json:"path"`
+	Attempt      int     `json:"attempt"`
+	Status       int     `json:"status"`
+	Bytes        int64   `json:"bytes"`
+	DurationMs   int64   `json:"duration_ms"`
+	Note         string  `json:"note"`
+	Error        string  `json:"error,omitempty"`
+	Model        string  `json:"model,omitempty"`
+	InTokens     int64   `json:"in_tokens"`
+	OutTokens    int64   `json:"out_tokens"`
+	TPS          float64 `json:"tps"`
+	TokensEst    bool    `json:"tokens_estimated,omitempty"`
+	RequestDump  string  `json:"request_dump,omitempty"`
+	ResponseDump string  `json:"response_dump,omitempty"`
 }
 
 type ring struct {
@@ -121,6 +126,8 @@ var (
 	uiHub  = newHub()
 )
 
+var usageStore *UsageStore
+
 var (
 	dumpCounter int64
 	dumpDirCfg  string
@@ -186,6 +193,10 @@ func initUI(mux *http.ServeMux, proxyFn http.HandlerFunc, cfg config) {
 			"hedge_after":  cfg.hedgeAfter.String(),
 			"max_body_mb":  cfg.maxBody >> 20,
 		})
+	})
+
+	mux.HandleFunc("/api/usage", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, usageStore.Summary())
 	})
 
 	mux.HandleFunc("/api/requests", func(w http.ResponseWriter, r *http.Request) {
@@ -336,6 +347,10 @@ func startAdminServers(cfg config) {
 			"max_body_mb": cfg.maxBody >> 20,
 		})
 	})
+	mux.HandleFunc("/api/usage", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, usageStore.Summary())
+	})
+
 	mux.HandleFunc("/api/requests", func(w http.ResponseWriter, r *http.Request) {
 		limit := 200
 		if v := r.URL.Query().Get("limit"); v != "" {

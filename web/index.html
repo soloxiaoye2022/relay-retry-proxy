@@ -45,6 +45,22 @@
       <div class="k">成功率</div>
       <div class="v">{{ successRate }}</div>
     </div>
+    <div class="card">
+      <div class="k">今日输入 tokens</div>
+      <div class="v">{{ fmtNum(usage.today.in) }}</div>
+    </div>
+    <div class="card">
+      <div class="k">今日输出 tokens</div>
+      <div class="v">{{ fmtNum(usage.today.out) }}</div>
+    </div>
+    <div class="card">
+      <div class="k">今日均速 (tok/s)</div>
+      <div class="v">{{ fmtTps(usage.today.tps) }}</div>
+    </div>
+    <div class="card">
+      <div class="k">累计 tokens</div>
+      <div class="v">{{ fmtNum(usage.total.total) }}</div>
+    </div>
   </section>
 
   <section class="panel">
@@ -63,6 +79,43 @@
 
   <section class="panel">
     <div class="panel-head">
+      <h2>用量统计 <span class="muted">{{ usage.day }}</span></h2>
+      <div class="tools">
+        <span class="muted" v-if="usage.today.est_reqs">其中 {{ usage.today.est_reqs }} 条为估算</span>
+        <span class="muted">存储：{{ usage.storage }}</span>
+      </div>
+    </div>
+    <div class="usage-grid">
+      <div>
+        <div class="sub">按模型</div>
+        <table class="mini">
+          <thead><tr><th>模型</th><th class="right">请求</th><th class="right">输入</th><th class="right">输出</th><th class="right">tok/s</th></tr></thead>
+          <tbody>
+            <tr v-for="m in usage.models" :key="m.model">
+              <td class="mono">{{ m.model }}</td>
+              <td class="mono right">{{ m.reqs }}</td>
+              <td class="mono right">{{ fmtNum(m.in) }}</td>
+              <td class="mono right">{{ fmtNum(m.out) }}</td>
+              <td class="mono right">{{ fmtTps(m.tps) }}</td>
+            </tr>
+            <tr v-if="!usage.models || usage.models.length === 0"><td colspan="5" class="empty">暂无数据</td></tr>
+          </tbody>
+        </table>
+      </div>
+      <div>
+        <div class="sub">近 24 小时（输出 tokens）</div>
+        <div class="bars">
+          <div class="bar-item" v-for="h in usage.hourly" :key="h.hour" :title="h.hour + '  输入 ' + h.in + ' / 输出 ' + h.out">
+            <div class="bar" :style="{ height: barH(h.out) }"></div>
+            <div class="bar-x">{{ h.hour.slice(0,2) }}</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <div class="panel-head">
       <h2>最近请求 <span class="muted">({{ requests.length }})</span></h2>
       <div class="tools">
         <input v-model="filter" placeholder="过滤 path / 状态 / id">
@@ -74,25 +127,29 @@
       <table>
         <thead>
           <tr>
-            <th>时间</th><th>ID</th><th>路径</th><th>尝试</th><th>状态</th>
-            <th>字节</th><th>耗时</th><th>备注</th>
+            <th>时间</th><th>ID</th><th>模型</th><th>状态</th><th>尝试</th>
+            <th class="right">输入</th><th class="right">输出</th><th class="right">tok/s</th>
+            <th class="right">字节</th><th class="right">耗时</th><th>备注</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="r in filtered" :key="r.seq" :class="rowClass(r)">
             <td class="mono">{{ r.time }}</td>
             <td class="mono">{{ r.id }}</td>
-            <td class="mono">{{ r.path }}</td>
-            <td class="mono center">{{ r.attempt }}</td>
+            <td class="mono">{{ r.model || '—' }}</td>
             <td class="mono center">
               <span class="badge" :class="statusClass(r.status)">{{ r.status || '—' }}</span>
             </td>
+            <td class="mono center">{{ r.attempt }}</td>
+            <td class="mono right">{{ r.in_tokens ? fmtNum(r.in_tokens) : '—' }}</td>
+            <td class="mono right">{{ r.out_tokens ? fmtNum(r.out_tokens) : '—' }}</td>
+            <td class="mono right">{{ r.tps ? fmtTps(r.tps) : '—' }}</td>
             <td class="mono right">{{ fmtBytes(r.bytes) }}</td>
             <td class="mono right">{{ fmtDur(r.duration_ms) }}</td>
-            <td class="note">{{ r.note }}</td>
+            <td class="note">{{ r.note }}{{ r.tokens_estimated ? ' (token 估算)' : '' }}</td>
           </tr>
           <tr v-if="filtered.length === 0">
-            <td colspan="8" class="empty">暂无请求</td>
+            <td colspan="11" class="empty">暂无请求</td>
           </tr>
         </tbody>
       </table>

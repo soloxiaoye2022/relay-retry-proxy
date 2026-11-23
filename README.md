@@ -192,6 +192,34 @@ DUMP_BODY=0          # 1=请求体也落盘（默认 0，避免把 prompt 写进
 `session` / `credential` 的请求头一律打成 `***REDACTED***`；`X-Forwarded-For`、`X-Real-IP`
 也打码；请求体默认不落盘。
 
+
+## Token 统计与持久化
+
+看板顶部新增四张卡片：今日输入 / 今日输出 / 今日均速(tok/s) / 累计 tokens；
+下方"用量统计"面板给出**按模型**的请求数、输入、输出、tok/s，以及**近 24 小时**输出柱状图；
+请求明细表新增 `模型 / 输入 / 输出 / tok/s` 四列。
+
+数据来源（与 new-api 之类的中转站口径一致）：
+
+1. **优先取上游返回的 usage**：兼容
+   - `chat/completions`：`usage.prompt_tokens` / `completion_tokens` / `total_tokens`
+   - `responses`：`usage.input_tokens` / `output_tokens` / `total_tokens`
+   代理在流式响应里扫最后一个 `usage` 对象（保留尾部 256 KB），不做缓冲、不改写响应。
+2. **上游没给 usage 时按字节估算**：约 3 字节/token，记录里标 `est:true`，看板显示"其中 N 条为估算"。
+3. **4xx/5xx 不计 token**：错误响应体不是模型输出。
+
+速度：`tok/s = output_tokens / (请求总耗时秒)`，按请求算，聚合时按总输出/总耗时算均速。
+
+持久化：默认写在日志目录下的 `usage/usage-YYYY-MM-DD.jsonl`（每天一个文件，`0600`）：
+
+```json
+{"ts":1795447841,"id":"7a002642","path":"/v1/chat/completions","model":"deepseek-v4.1-flash",
+ "status":200,"in":3416309,"out":3204,"total":3419513,"dur_ms":90000,"tps":35.6}
+```
+
+启动时扫描最近 30 天文件重建聚合，**重启不丢数据**（实测：重启后 today/models 与重启前一致）。
+配置项：`USAGE_DIR` / `-usage-dir`（默认 `<日志目录>/usage`）。
+
 ## 配置文件
 
 可执行文件同目录放一个 `relay-retry-proxy.env`，启动时自动读取（不用带任何参数）：

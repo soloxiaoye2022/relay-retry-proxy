@@ -5,6 +5,9 @@ createApp({
     const health = ref({ ok:false, version:'-', upstreams:[], started_at:'' });
     const stats = ref({ total:0, succeeded:0, failed:0, retried:0, upstream5xx:0 });
     const cfg = ref({});
+    const usage = ref({ today: { in:0, out:0, total:0, reqs:0, tps:0, est_reqs:0 },
+                        total: { in:0, out:0, total:0, reqs:0, tps:0 },
+                        models: [], hourly: [], day: '', storage: '' });
     const requests = ref([]);
     const filter = ref('');
     const onlyIssues = ref(false);
@@ -55,20 +58,34 @@ createApp({
       if (ms < 1000) return ms + ' ms';
       return (ms / 1000).toFixed(2) + ' s';
     };
+    const fmtNum = n => {
+      if (n == null) return '—';
+      if (n < 1000) return String(n);
+      if (n < 1e6) return (n / 1000).toFixed(n < 1e4 ? 2 : 1) + 'k';
+      return (n / 1e6).toFixed(2) + 'M';
+    };
+    const fmtTps = v => (v == null || v <= 0) ? '—' : v.toFixed(1);
+    const maxOut = computed(() => Math.max(1, ...(usage.value.hourly || []).map(h => h.out || 0)));
+    const barH = v => {
+      const pct = Math.max(2, Math.round(((v || 0) / maxOut.value) * 100));
+      return pct + '%';
+    };
     const statusClass = s => !s ? 'sn' : (s < 400 ? 's2' : s < 500 ? 's4' : 's5');
     const rowClass = r => (r.status && r.status >= 400) || r.error ? 'fail'
                         : (r.attempt > 1 ? 'retry' : '');
 
     async function loadAll() {
       try {
-        const [h, s, c] = await Promise.all([
+        const [h, s, c, u] = await Promise.all([
           fetch('/api/health').then(r => r.json()),
           fetch('/api/stats').then(r => r.json()),
           fetch('/api/config').then(r => r.json()),
+          fetch('/api/usage').then(r => r.json()),
         ]);
         health.value = h;
         stats.value = s;
         cfg.value = c;
+        usage.value = u;
       } catch (e) { /* 忽略瞬时失败 */ }
     }
 
@@ -88,6 +105,9 @@ createApp({
       });
       es.addEventListener('stats', ev => {
         try { stats.value = JSON.parse(ev.data); } catch (e) {}
+      });
+      es.addEventListener('usage', ev => {
+        try { usage.value = JSON.parse(ev.data); } catch (e) {}
       });
       es.addEventListener('error', () => {
         sseState.value = 'dead';
@@ -115,6 +135,7 @@ createApp({
 
     return {
       health, stats, cfg, requests, filter, onlyIssues, sseState, sseLabel,
+      usage, fmtNum, fmtTps, barH,
       successRate, uptimeText, filtered, fmtBytes, fmtDur, statusClass, rowClass, clearLocal,
     };
   },
