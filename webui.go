@@ -40,6 +40,8 @@ type RequestRecord struct {
 	TTFTMs       int64   `json:"ttft_ms,omitempty"`
 	GenTPS       float64 `json:"gen_tps,omitempty"`
 	CachedTokens int64   `json:"cached_tokens,omitempty"`
+	Cost         float64 `json:"cost,omitempty"`
+	TokenSrc     string  `json:"token_src,omitempty"`
 	ReasonTokens int64   `json:"reasoning_tokens,omitempty"`
 	RequestDump  string  `json:"request_dump,omitempty"`
 	ResponseDump string  `json:"response_dump,omitempty"`
@@ -131,6 +133,7 @@ var (
 )
 
 var usageStore *UsageStore
+var priceFileCfg string
 
 var (
 	dumpCounter int64
@@ -197,6 +200,10 @@ func initUI(mux *http.ServeMux, proxyFn http.HandlerFunc, cfg config) {
 			"hedge_after":  cfg.hedgeAfter.String(),
 			"max_body_mb":  cfg.maxBody >> 20,
 		})
+	})
+
+	mux.HandleFunc("/api/prices", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, prices.snapshot())
 	})
 
 	mux.HandleFunc("/api/usage", func(w http.ResponseWriter, r *http.Request) {
@@ -351,6 +358,10 @@ func startAdminServers(cfg config) {
 			"max_body_mb": cfg.maxBody >> 20,
 		})
 	})
+	mux.HandleFunc("/api/prices", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, prices.snapshot())
+	})
+
 	mux.HandleFunc("/api/usage", func(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, usageStore.Summary())
 	})

@@ -31,21 +31,24 @@ type UsageRecord struct {
 	GenTPS  float64 `json:"gen_tps,omitempty"` // 纯生成阶段 tok/s（扣掉 TTFT）
 	Cached  int64   `json:"cached_tokens,omitempty"`
 	Reason  int64   `json:"reasoning_tokens,omitempty"`
+	Cost    float64 `json:"cost,omitempty"`
+	Src     string  `json:"src,omitempty"` // usage / tiktoken / bytes
 }
 
 type bucket struct {
-	In      int64 `json:"in"`
-	Out     int64 `json:"out"`
-	Total   int64 `json:"total"`
-	Reqs    int64 `json:"reqs"`
-	DurMs   int64 `json:"dur_ms"`
-	Errors  int64 `json:"errors"`
-	EstReqs int64 `json:"est_reqs"`
-	TTFTSum int64 `json:"ttft_ms_sum"`
-	GenOut  int64 `json:"gen_out"` // 用于算生成阶段均速
-	GenMs   int64 `json:"gen_ms"`
-	Cached  int64 `json:"cached"`
-	Reason  int64 `json:"reasoning"`
+	In      int64   `json:"in"`
+	Out     int64   `json:"out"`
+	Total   int64   `json:"total"`
+	Reqs    int64   `json:"reqs"`
+	DurMs   int64   `json:"dur_ms"`
+	Errors  int64   `json:"errors"`
+	EstReqs int64   `json:"est_reqs"`
+	TTFTSum int64   `json:"ttft_ms_sum"`
+	GenOut  int64   `json:"gen_out"` // 用于算生成阶段均速
+	GenMs   int64   `json:"gen_ms"`
+	Cost    float64 `json:"cost"`
+	Cached  int64   `json:"cached"`
+	Reason  int64   `json:"reasoning"`
 }
 
 func (b *bucket) add(r UsageRecord) {
@@ -60,6 +63,7 @@ func (b *bucket) add(r UsageRecord) {
 	if r.Est {
 		b.EstReqs++
 	}
+	b.Cost += r.Cost
 	b.Cached += r.Cached
 	b.Reason += r.Reason
 	if r.TTFTMs > 0 {
@@ -138,6 +142,10 @@ func (s *UsageStore) reload() {
 }
 
 func (s *UsageStore) applyLocked(r UsageRecord, today string) {
+	// 历史记录可能没有 cost 字段（早期版本写入），用当前价格补算
+	if r.Cost == 0 && (r.In > 0 || r.Out > 0) {
+		r.Cost = prices.cost(r.Model, r.In, r.Out)
+	}
 	s.totalB.add(r)
 	if r.Ts > 0 {
 		day := time.Unix(r.Ts, 0).Format("2006-01-02")
@@ -221,6 +229,7 @@ type modelStat struct {
 	Out   int64   `json:"out"`
 	Reqs  int64   `json:"reqs"`
 	TPS   float64 `json:"tps"`
+	Cost  float64 `json:"cost"`
 }
 
 // Summary 返回给 WebUI 的用量视图。
@@ -248,7 +257,7 @@ func (s *UsageStore) Summary() map[string]any {
 
 	models := make([]modelStat, 0, len(s.byModel))
 	for m, b := range s.byModel {
-		models = append(models, modelStat{Model: m, In: b.In, Out: b.Out, Reqs: b.Reqs, TPS: b.tps()})
+		models = append(models, modelStat{Model: m, In: b.In, Out: b.Out, Reqs: b.Reqs, TPS: b.tps(), Cost: b.Cost})
 	}
 	sort.Slice(models, func(i, j int) bool { return models[i].Out > models[j].Out })
 	if len(models) > 12 {
@@ -262,6 +271,7 @@ func (s *UsageStore) Summary() map[string]any {
 			"tps": s.todayB.tps(), "est_reqs": s.todayB.EstReqs,
 			"gen_tps": s.todayB.genTps(), "ttft_ms": s.todayB.ttft(),
 			"cached": s.todayB.Cached, "reasoning": s.todayB.Reason,
+			"cost": s.todayB.Cost, "currency": prices.currencyCode(),
 		},
 		"total": map[string]any{
 			"in": s.totalB.In, "out": s.totalB.Out, "total": s.totalB.Total,
@@ -269,6 +279,7 @@ func (s *UsageStore) Summary() map[string]any {
 			"tps": s.totalB.tps(), "est_reqs": s.totalB.EstReqs,
 			"gen_tps": s.totalB.genTps(), "ttft_ms": s.totalB.ttft(),
 			"cached": s.totalB.Cached, "reasoning": s.totalB.Reason,
+			"cost": s.totalB.Cost, "currency": prices.currencyCode(),
 		},
 		"models":  models,
 		"hourly":  series,

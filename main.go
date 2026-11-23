@@ -26,7 +26,7 @@ import (
 	"time"
 )
 
-const version = "1.3.2"
+const version = "1.4.0"
 
 // shutdownGrace 与应用层一致：给在途流式请求留足时间，避免重启把用户请求打断
 const shutdownGrace = 150 * time.Second
@@ -47,6 +47,7 @@ type config struct {
 	dumpKeep    int
 	dumpBody    bool
 	usageDir    string
+	priceFile   string
 	logPath     string
 	maxBody     int64
 }
@@ -74,6 +75,8 @@ func main() {
 	}
 
 	dumpDirCfg, dumpKeepCfg = cfg.dumpDir, cfg.dumpKeep
+	priceFileCfg = cfg.priceFile
+	prices.load(cfg.priceFile)
 	usageStore = newUsageStore(cfg.usageDir)
 	defer usageStore.Close()
 	log.Printf("[usage] 持久化目录 %s（已恢复历史 %d 条聚合）", cfg.usageDir, usageStore.totalB.Reqs)
@@ -137,6 +140,8 @@ func parseFlags() config {
 		dumpKeep   = flag.Int("dump-keep", 400, "每个方向保留的文件数")
 		dumpBody   = flag.Bool("dump-body", false, "dump 里是否包含请求体（默认 false，避免落盘 prompt）")
 		usageDir   = flag.String("usage-dir", "", "用量数据持久化目录（默认：日志目录下的 usage/）")
+		priceFile  = flag.String("prices", "", "模型单价文件 prices.json（默认：配置目录下）")
+		tokModel   = flag.String("tokenize", "", "从 stdin 读文本，按指定模型词表打印 token 数后退出（自测用）")
 		listen     = flag.String("listen", "127.0.0.1:8443", "监听地址")
 		upstreams  = flag.String("upstream", "http://127.0.0.1:4000", "上游 base URL，逗号分隔可配多个做故障切换")
 		maxAtt     = flag.Int("max-attempts", 5, "最大尝试次数（含首次）")
@@ -149,6 +154,14 @@ func parseFlags() config {
 		maxBodyMB  = flag.Int64("max-body-mb", 64, "请求体上限（MB）")
 	)
 	flag.Parse()
+	if *tokModel != "" {
+		in, err := io.ReadAll(os.Stdin)
+		if err != nil {
+			log.Fatalf("read stdin: %v", err)
+		}
+		fmt.Printf("%d\n", CountTokens(*tokModel, string(in)))
+		os.Exit(0)
+	}
 	if *showVer {
 		fmt.Printf("relay-retry-proxy %s\n", version)
 		os.Exit(0)
@@ -223,6 +236,15 @@ func parseFlags() config {
 	}
 	cfg.logPath = pick("LOG", *logPath, explicit["log"])
 	cfg.usageDir = pick("USAGE_DIR", *usageDir, explicit["usage-dir"])
+	cfg.priceFile = pick("PRICES_FILE", *priceFile, explicit["prices"])
+	if cfg.priceFile == "" {
+		for _, cand := range []string{"/etc/relay-retry-proxy/prices.json", filepath.Join(filepath.Dir(cfg.usageDir), "prices.json")} {
+			if _, err := os.Stat(cand); err == nil {
+				cfg.priceFile = cand
+				break
+			}
+		}
+	}
 	if cfg.usageDir == "" {
 		base := filepath.Dir(cfg.logPath)
 		if cfg.logPath == "" {
@@ -433,15 +455,31 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 			st.succeeded.Add(1)
 			inTok, outTok, totTok, hasUsage := parseUsage(tap.buf)
 			est := false
+			srcTok := "usage"
 			// 4xx/5xx 的响应体是错误信息，不是模型输出，不计 token
 			if res.resp.StatusCode >= 400 {
 				inTok, outTok, totTok, hasUsage = 0, 0, 0, true
 			} else if !hasUsage {
-				inTok = estimateTokensFromBytes(body)
-				outTok = atomic.LoadInt64(&tap.estTok)
+				// 本地 BPE 分词（近似 tiktoken），比字节估算准得多
+				srcTok = "tiktoken"
+				if v, ok := CountRequestTokens(model, body); ok && v > 0 {
+					inTok = int64(v)
+				} else {
+					inTok = estimateTokensFromBytes(body)
+					srcTok = "bytes"
+				}
+				if txt := extractStreamText(tap.buf); txt != "" {
+					outTok = int64(CountTokens(model, txt))
+				} else {
+					outTok = atomic.LoadInt64(&tap.estTok)
+					srcTok = "bytes"
+				}
 				totTok = inTok + outTok
-				est = true
+				est = srcTok != "tiktoken"
+			} else {
+				srcTok = "usage"
 			}
+			cost := prices.cost(model, inTok, outTok)
 			durMs := time.Since(start).Milliseconds()
 			tps := 0.0
 			if outTok > 0 && durMs > 0 {
@@ -458,6 +496,8 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 			}
 			rec.TTFTMs = ttftMs
 			rec.GenTPS = genTps
+			rec.Cost = cost
+			rec.TokenSrc = srcTok
 			rec.CachedTokens = lastCached
 			rec.ReasonTokens = lastReason
 			rec.Model = model
@@ -470,6 +510,7 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 				Status: res.resp.StatusCode, In: inTok, Out: outTok, Total: totTok,
 				DurMs: durMs, TPS: tps, Est: est, Retries: res.attempt - 1,
 				TTFTMs: ttftMs, GenTPS: genTps, Cached: lastCached, Reason: lastReason,
+				Cost: cost, Src: srcTok,
 			})
 			rec.Attempt = res.attempt
 			rec.Status = res.resp.StatusCode

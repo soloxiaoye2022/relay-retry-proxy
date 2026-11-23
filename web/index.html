@@ -66,6 +66,14 @@
       <div class="v">{{ fmtDur(Math.round(usage.today.ttft_ms || 0)) }}</div>
     </div>
     <div class="card">
+      <div class="k">今日花费 ({{ usage.today.currency || 'USD' }})</div>
+      <div class="v">{{ fmtCost(usage.today.cost) }}</div>
+    </div>
+    <div class="card">
+      <div class="k">累计花费 ({{ usage.total.currency || 'USD' }})</div>
+      <div class="v">{{ fmtCost(usage.total.cost) }}</div>
+    </div>
+    <div class="card">
       <div class="k">累计 tokens</div>
       <div class="v">{{ fmtNum(usage.total.total) }}</div>
     </div>
@@ -106,7 +114,7 @@
       <div>
         <div class="sub">按模型</div>
         <table class="mini">
-          <thead><tr><th>模型</th><th class="right">请求</th><th class="right">输入</th><th class="right">输出</th><th class="right">tok/s</th></tr></thead>
+          <thead><tr><th>模型</th><th class="right">请求</th><th class="right">输入</th><th class="right">输出</th><th class="right">tok/s</th><th class="right">花费</th></tr></thead>
           <tbody>
             <tr v-for="m in usage.models" :key="m.model">
               <td class="mono">{{ m.model }}</td>
@@ -114,6 +122,7 @@
               <td class="mono right">{{ fmtNum(m.in) }}</td>
               <td class="mono right">{{ fmtNum(m.out) }}</td>
               <td class="mono right">{{ fmtTps(m.tps) }}</td>
+              <td class="mono right">{{ fmtCost(m.cost) }}</td>
             </tr>
             <tr v-if="!usage.models || usage.models.length === 0"><td colspan="5" class="empty">暂无数据</td></tr>
           </tbody>
@@ -146,7 +155,7 @@
           <tr>
             <th>时间</th><th>ID</th><th>模型</th><th>状态</th><th>尝试</th>
             <th class="right">输入</th><th class="right">输出</th><th class="right">TTFT</th>
-            <th class="right">总 tok/s</th><th class="right">生成 tok/s</th>
+            <th class="right">总 tok/s</th><th class="right">生成 tok/s</th><th class="right">花费</th>
             <th class="right">字节</th><th class="right">耗时</th><th>备注</th>
           </tr>
         </thead>
@@ -164,12 +173,13 @@
             <td class="mono right">{{ r.ttft_ms ? fmtDur(r.ttft_ms) : '—' }}</td>
             <td class="mono right">{{ r.tps ? fmtTps(r.tps) : '—' }}</td>
             <td class="mono right">{{ r.gen_tps ? fmtTps(r.gen_tps) : '—' }}</td>
+            <td class="mono right">{{ r.cost ? fmtCost(r.cost) : '—' }}</td>
             <td class="mono right">{{ fmtBytes(r.bytes) }}</td>
             <td class="mono right">{{ fmtDur(r.duration_ms) }}</td>
             <td class="note">{{ r.note }}{{ r.tokens_estimated ? ' (token 估算)' : '' }}</td>
           </tr>
           <tr v-if="filtered.length === 0">
-            <td colspan="13" class="empty">暂无请求</td>
+            <td colspan="14" class="empty">暂无请求</td>
           </tr>
         </tbody>
       </table>

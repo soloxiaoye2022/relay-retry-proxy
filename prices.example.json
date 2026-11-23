@@ -1,0 +1,8 @@
+{
+  "currency": "CNY",
+  "default": { "in": 0.0, "out": 0.0 },
+  "models": {
+    "deepseek-v4.1-flash": { "in": 0.5, "out": 1.0 },
+    "gpt-6.1-sol": { "in": 8.0, "out": 24.0 }
+  }
+}

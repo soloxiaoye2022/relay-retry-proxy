@@ -230,6 +230,48 @@ DUMP_BODY=0          # 1=请求体也落盘（默认 0，避免把 prompt 写进
 启动时扫描最近 30 天文件重建聚合，**重启不丢数据**（实测：重启后 today/models 与重启前一致）。
 配置项：`USAGE_DIR` / `-usage-dir`（默认 `<日志目录>/usage`）。
 
+
+## 精确分词与成本统计
+
+### Token 计数
+
+上游给了 `usage` 就直接用（与 new-api 口径一致）；没给时用**内嵌 tiktoken 词表 + 自研 BPE**本地精确计数：
+
+- 内嵌 `cl100k_base`（1.7 MB）与 `o200k_base`（3.5 MB）词表，按模型名自动选择
+- 预切分规则复刻 tiktoken（字母串含前导空格、1~3 位数字、标点串+换行、空白串、缩略词后缀合并）
+- 与 Python `tiktoken` 0.14 对拍 22 个样本（英文/中文/中英混排/代码/JSON/URL/emoji/缩略词/长文），**22/22 完全一致，误差 0.00%**
+
+自测命令：
+
+```bash
+echo "你的文本" | relay-retry-proxy -tokenize gpt-4o        # o200k
+echo "你的文本" | relay-retry-proxy -tokenize deepseek-v4  # cl100k
+```
+
+性能：307 KB 请求体 ≈ 7.2 万 token，耗时 0.17 秒（仅在上游没给 usage 时触发）。
+
+### 成本统计
+
+配置文件 `prices.json`（默认 `/etc/relay-retry-proxy/prices.json`，也可用 `PRICES_FILE` / `-prices` 指定）：
+
+```json
+{
+  "currency": "CNY",
+  "default": { "in": 0.0, "out": 0.0 },
+  "models": {
+    "deepseek-v4.1-flash": { "in": 0.5, "out": 1.0 },
+    "gpt-6.1-sol":         { "in": 8.0, "out": 24.0 }
+  }
+}
+```
+
+单位是**每 100 万 token**；没配的模型走 `default`。文件改了 25 个请求内自动重载，不用重启。
+
+成本 = `in × 单价in/1M + out × 单价out/1M`，随用量一起写进 JSONL；
+历史记录若没有 cost 字段，启动时会用当前价格补算。看板显示今日/累计花费、按模型花费、单请求花费。
+
+接口：`GET /api/prices`（当前价格表）、`GET /api/usage`（含 cost）
+
 ## 配置文件
 
 可执行文件同目录放一个 `relay-retry-proxy.env`，启动时自动读取（不用带任何参数）：

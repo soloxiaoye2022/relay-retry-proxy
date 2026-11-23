@@ -65,6 +65,11 @@ createApp({
       if (n < 1e6) return (n / 1000).toFixed(n < 1e4 ? 2 : 1) + 'k';
       return (n / 1e6).toFixed(2) + 'M';
     };
+    const fmtCost = v => {
+      if (v == null || v === 0) return '—';
+      if (v < 0.0001) return '<0.0001';
+      return v < 1 ? v.toFixed(4) : v.toFixed(2);
+    };
     const fmtTps = v => (v == null || v <= 0) ? '—' : v.toFixed(1);
     const maxOut = computed(() => Math.max(1, ...(usage.value.hourly || []).map(h => h.out || 0)));
     const barH = v => {
@@ -143,7 +148,7 @@ createApp({
 
     return {
       health, stats, cfg, requests, filter, onlyIssues, sseState, sseLabel,
-      usage, live, fmtNum, fmtTps, barH,
+      usage, live, fmtNum, fmtTps, fmtCost, barH,
       successRate, uptimeText, filtered, fmtBytes, fmtDur, statusClass, rowClass, clearLocal,
     };
   },
