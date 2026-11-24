@@ -136,42 +136,6 @@ WB_RETRY_CHANNEL=1     # 1=开（默认）, 0=关
 
 `/__health` 里可以看到 `wbRetryChannel` 开关状态和 `wbChannelRejected` 命中次数。
 
-### 提示词指纹清洗（真正导致 11128 的原因）
-
-抓包比对后确认：**换头不是问题，提示词才是**。上游网关会看**首条 system 消息开头**
-的客户端签名，命中就判「非官方客户端」：
-
-| 首条 system 文本 | 上游 |
-|---|---|
-| `You are an interactive agent in TraeCode` | 400 / code 11128 |
-| `You are an interactive agent in TraeCode that ...` | 400 / code 11128 |
-| `You are an interactive agent in TraeCodx` | 200 |
-| `AYou are an interactive agent in TraeCode` | 200（前缀被打断） |
-| `You are an interactive agent in CodeBuddy` | 200 |
-
-同一个 1.1 MB 真实请求，只把 system 里的 `TraeCode` 换成中性产品名，就立即从 400 变 200；
-直接删掉那条 system 消息也是 200。请求头（官方 UA / `X-Agent-*` / `Origin` / `X-B3-*`）
-在两种情况下完全一样，所以问题从来不在头上。
-
-打开后（默认开），按下面的方式打断指纹。**工具名、工具参数、图片数据、用户消息一律不动**：
-
-```ini
-WB_SANITIZE=1                # 1=开（默认）, 0=关
-WB_SANITIZE_STYLE=prefix     # prefix（默认）| rename | both
-```
-
-| 方式 | 做法 | 影响 |
-|---|---|---|
-| `prefix`（默认） | 只在首条 system 文本前补一个换行 | 措辞一个字不改，仅打断前缀匹配 |
-| `rename` | `TraeCode` → `CodeBuddy` | 会改变提示词里的产品名 |
-| `both` | 两者都做 | 双保险 |
-
-选 `prefix` 当默认，是因为实测网关只 trim 空格、不 trim 换行：`" You are..."` 仍被拒，
-`"\nYou are..."` 直接 200。这样既解开渠道校验，又不动用户/客户端的提示词语义。
-
-`/__health` 里有 `wbSanitize`、`wbSanitizeStyle` 与 `wbChannelRejected`（命中渠道拦截的次数）。
-两条防线是配合用的：清洗负责让请求根本不触发校验，重试负责在网关抖动时兜底。
-
 
 ## 空思考守卫（empty_reasoning_only）
 

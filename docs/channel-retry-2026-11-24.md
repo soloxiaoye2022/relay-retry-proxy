@@ -53,22 +53,6 @@ trae 的 X-Model-Provider / Acl-Token / X-Bridge-Transport / UA: hertz 已清除
 New API v1.0.0-rc.49 在该模型上存在多条上游渠道，其中 WorkBuddy 渠道在窗口内一律拒绝）。
 窗口过后同一条请求 200。
 
-## 2.1 真正的根因：提示词指纹（补记，22:37）
-
-抓包比对后进一步确认，11128 与请求头无关，而是**首条 system 消息的客户端签名**：
-
-| 首条 system 文本 | 结果 |
-|---|---|
-| `You are an interactive agent in TraeCode` | 400 / 11128 |
-| `...in TraeCode that ...` | 400 / 11128 |
-| `...in TraeCodx` | 200 |
-| `AYou are an interactive agent in TraeCode` | 200（前缀被打断） |
-| `...in CodeBuddy` | 200 |
-| 直接删掉该 system 消息 | 200 |
-
-同一个 1.1 MB body，仅把 `TraeCode` 改为中性名就 200；官方头在两种情况下完全一致。
-因此方案里增加「提示词指纹清洗」，并把重试作为抖动兜底。
-
 ## 3. 方案
 
 沿用代理已有的「重试 + 对冲」框架，把「渠道校验拒绝」纳入可重试错误：
@@ -81,16 +65,7 @@ New API v1.0.0-rc.49 在该模型上存在多条上游渠道，其中 WorkBuddy 
    - 用尽尝试 → 把上游原始 400 体原样透传，不伪造错误；
    - 未命中（普通 400，如 `input is required`）→ 把已读出的 body 放回，照常透传。
 3. 开关：`WB_RETRY_CHANNEL`（env）/ `-wb-retry-channel`（flag），默认开启。
-4. `/__health` 增加 `wbRetryChannel`、`wbChannelRejected`、`wbSanitize`。
-5. `workbuddy.go`：新增 `wbSanitizeBody`，支持三种处理方式（`WB_SANITIZE_STYLE`）：
-   - `prefix`（默认）：只在首条 system 文本前补一个换行打断前缀匹配，**措辞不变**；
-     实测网关 trim 空格但不 trim 换行（`" You are..."` 仍 400，`"\nYou are..."` 200）。
-   - `rename`：把 `TraeCode` 改成中性产品名。
-   - `both`：两者都做。
-   只触碰 `instructions`、`input[].content`、`messages[].content`，
-   工具名/参数/图片/用户内容不动；开关 `WB_SANITIZE`（默认开）。
-6. 顺带修复 `wbResponsesToChat` 丢掉 `type=message` 普通消息的缺陷：真实客户端
-   的 system 提示词原本会被整条丢弃（WB_API_MODE=auto 时）。
+4. `/__health` 增加 `wbRetryChannel`、`wbChannelRejected`。
 
 ### 顺带修掉一个真实缺陷
 

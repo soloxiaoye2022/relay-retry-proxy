@@ -1,9 +1,6 @@
 package main
 
 import (
-	"bytes"
-	"context"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -164,30 +161,5 @@ func TestProxyStreamNotDuplicated(t *testing.T) {
 	}
 	if n := strings.Count(rec.Body.String(), "[DONE]"); n != 1 {
 		t.Fatalf("[DONE] 出现 %d 次，应为 1 次", n)
-	}
-}
-
-// buildRequest 必须在 WB 模式下把 system 指纹清掉，其余结构保持原样。
-func TestBuildRequestSanitizesFingerprint(t *testing.T) {
-	body := []byte(`{"model":"deepseek-v4.1-flash","input":[{"type":"message","role":"system",` +
-		`"content":[{"type":"input_text","text":"You are an interactive agent in TraeCode that helps the USER."}]}]}`)
-	orig := httptest.NewRequest(http.MethodPost, "/v1/responses", bytes.NewReader(body))
-	orig.Header.Set("Authorization", "Bearer sk-test")
-	orig.Header.Set("User-Agent", "hertz")
-
-	cfg := workbuddyConfig{Mode: "desktop", Realm: "intl", Sanitize: true, RetryChannel: true}
-	req, err := buildRequest(orig, body, "http://192.168.5.246:4000", context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("buildRequest 失败：%v", err)
-	}
-	sent, _ := io.ReadAll(req.Body)
-	if strings.Contains(string(sent), "in TraeCode") {
-		t.Fatalf("出站 body 仍带 Trae 指纹：%s", sent)
-	}
-	if ua := req.Header.Get("User-Agent"); !strings.HasPrefix(ua, "WorkBuddy/") {
-		t.Fatalf("出站 UA 没被替换成官方身份：%q", ua)
-	}
-	if req.Header.Get("X-Model-Provider") != "" {
-		t.Fatalf("客户端私有头泄漏到上游：%v", req.Header)
 	}
 }
