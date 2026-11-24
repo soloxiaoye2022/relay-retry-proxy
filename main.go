@@ -66,7 +66,6 @@ type counters struct {
 	upstream5      int64
 	emptyReasoning atomic.Int64
 	channelReject  atomic.Int64
-	clientGone     atomic.Int64
 }
 
 var st counters
@@ -111,7 +110,6 @@ func main() {
 			"wbSanitizeStyle":   cfg.wb.SanitizeStyle,
 			"wbChannelRejected": st.channelReject.Load(),
 			"emptyReasoning":    st.emptyReasoning.Load(),
-			"clientGone":        st.clientGone.Load(),
 			"guardEnabled":      cfg.guard.Enabled,
 		})
 	})
@@ -655,7 +653,6 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 			rec.Status = res.resp.StatusCode
 			rec.Bytes = n
 			if copyErr != nil {
-				st.clientGone.Add(1)
 				rec.Note = "client gone"
 				rec.Error = copyErr.Error()
 			} else if hedgedAt > 0 {
