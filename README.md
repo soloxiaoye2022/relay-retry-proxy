@@ -227,7 +227,7 @@ curl -s http://127.0.0.1:8443/__health
   1. 把 `relay-retry-proxy-windows-amd64.exe` 拷到 Windows 跑：
      ```powershell
      .\relay-retry-proxy-windows-amd64.exe -listen 127.0.0.1:8443 `
-       -upstream http://your-relay:4000 -max-attempts 4 -head-timeout 180s
+       -upstream http://your-relay:4000 -max-attempts 8 -head-timeout 180s
      ```
      Base URL 填 `http://127.0.0.1:8443/v1`
   2. 或者走 SSH 隧道（把服务器上的代理映射到 Windows 本地）：
@@ -417,11 +417,31 @@ echo "你的文本" | relay-retry-proxy -tokenize deepseek-v4  # cl100k
 ```ini
 LISTEN=127.0.0.1:8443
 UPSTREAM=http://your-relay:4000
-MAX_ATTEMPTS=5
-BASE_DELAY=800ms
+MAX_ATTEMPTS=10
+BASE_DELAY=400ms
 MAX_DELAY=15s
-HEAD_TIMEOUT=90s
+HEAD_TIMEOUT=60s
 DIAL_TIMEOUT=10s
+HEDGE_AFTER=5s
+ADMIN_LISTEN=127.0.0.1:9090
+
+# 转发头策略：allow=只转发标准头（默认）｜pass=全量透传
+HEADER_MODE=allow
+
+# 上游渠道校验对齐（见上文「上游渠道校验」）
+WB_MODE=desktop
+WB_REALM=intl
+WB_CONVERT_PATH=0
+WB_API_MODE=chat
+WB_RETRY_CHANNEL=1
+WB_SANITIZE=1
+WB_SANITIZE_STYLE=prefix
+
+# 断流排查（可选）
+DUMP_DIR=
+DUMP_MAX_KB=2048
+DUMP_KEEP=200
+DUMP_BODY=0
 ```
 
 优先级：**命令行参数 > 配置文件 > 环境变量 > 内置默认值**。
@@ -435,16 +455,44 @@ Windows 打包版：`relay-retry-proxy-windows.zip`
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `-listen` | `127.0.0.1:8443` | 监听地址；Windows 想被局域网访问可写 `0.0.0.0:8443` |
-| `-upstream` | `http://your-relay:4000` | 上游；逗号分隔可配多个，按尝试轮转做故障切换 |
-| `-max-attempts` | `4` | 含首次的总尝试次数 |
-| `-base-delay` | `700ms` | 首次重试间隔 |
-| `-max-delay` | `12s` | 间隔上限 |
-| `-head-timeout` | `90s` | 等上游响应头的最长时间；模型思考久就调大 |
-| `-dial-timeout` | `10s` | TCP 建连超时；ZeroTier 链路抖动时尽早失败转入重试 |
-| `-hedge-after` | `10s` | 超时未拿到响应头就并行再发一次；`0` 关闭对冲 |
+| `-upstream` | `http://127.0.0.1:4000` | 上游；逗号分隔可配多个，按尝试轮转做故障切换 |
+| `-max-attempts` | `5` | 含首次的总尝试次数 |
+| `-base-delay` | `800ms` | 首次重试间隔 |
+| `-max-delay` | `15s` | 间隔上限 |
+| `-head-timeout` | `1m30s` | 等上游响应头的最长时间；模型思考久就调大 |
+| `-dial-timeout` | `10s` | TCP 建连超时；链路抖动时尽早失败转入重试 |
+| `-hedge-after` | `8s` | 超时未拿到响应头就并行再发一次；`0` 关闭对冲 |
 | `-admin-listen` | `127.0.0.1:9090` | WebUI 监听地址（只读，不含代理）；`0` 关闭 |
+| `-header-mode` | `allow` | 转发头策略：`allow` 只发标准 OpenAI 头，`pass` 全量透传 |
+| `-config` | 空 | 配置文件路径，默认读可执行文件同目录的 `relay-retry-proxy.env` |
 | `-log` | 空 | 日志文件，空则 stdout |
-| `-max-body-mb` | `64` | 请求体上限 |
+| `-max-body-mb` | `64` | 请求体上限（MB） |
+| `-dump-dir` | 空 | 请求/响应尾部落盘目录，空=不落盘（排查断流用） |
+| `-dump-max-kb` | `2048` | 单个 dump 文件上限（KB） |
+| `-dump-keep` | `400` | 每个方向保留的文件数 |
+| `-dump-body` | `false` | dump 里是否落请求体（默认不落，避免把 prompt 写到磁盘） |
+| `-usage-dir` | 空 | 用量 JSONL 目录，默认 `<日志目录>/usage` |
+| `-prices` | 空 | 模型单价文件 `prices.json` |
+| `-empty-guard` | `true` | 识别「只有 reasoning 没有正文」的空响应并重试 |
+| `-empty-guard-wait` | `3s` | 空思考判定的最长前瞻时间 |
+| `-tokenize` | 空 | 从 stdin 读文本，按指定模型词表打印 token 数后退出 |
+| `-version` | — | 打印版本后退出 |
+
+### WorkBuddy / 渠道校验相关
+
+| 参数 | 环境变量 | 默认 | 说明 |
+|---|---|---|---|
+| `-wb-mode` | `WB_MODE` | `off` | `off`/`desktop`/`vscode`/`cli`，出站身份 |
+| `-wb-realm` | `WB_REALM` | `intl` | `cn`（copilot.tencent.com）/ `intl`（www.workbuddy.ai） |
+| `-wb-ua` | `WB_UA` | 空 | 覆盖出站 UA，空=按身份自动生成 |
+| `-wb-ide-version` | `WB_IDE_VERSION` | 空 | 覆盖 `X-IDE-Version` |
+| `-wb-domain` | `WB_DOMAIN` | 空 | 覆盖 `X-Domain` |
+| `-wb-private-data` | `WB_PRIVATE_DATA` | `auto` | `X-Private-Data`：`auto`/`true`/`false` |
+| — | `WB_CONVERT_PATH` | `1` | 是否把 `/v1/*` 改写到 `/v2/chat/completions`（New API 前置时必须设 `0`） |
+| — | `WB_API_MODE` | `auto` | `auto` 自动识别入站协议；`chat` 不转换 body（前置 New API 时用） |
+| `-wb-retry-channel` | `WB_RETRY_CHANNEL` | `true` | 命中渠道校验拒绝（400 / code 11128）时重试 |
+| `-wb-sanitize` | `WB_SANITIZE` | `true` | 处理提示词里的客户端指纹 |
+| `-wb-sanitize-style` | `WB_SANITIZE_STYLE` | `prefix` | `prefix`（加换行，不改措辞）/`rename`（改产品名）/`both` |
 
 ## 自测
 
