@@ -153,14 +153,23 @@ WB_RETRY_CHANNEL=1     # 1=开（默认）, 0=关
 直接删掉那条 system 消息也是 200。请求头（官方 UA / `X-Agent-*` / `Origin` / `X-B3-*`）
 在两种情况下完全一样，所以问题从来不在头上。
 
-打开清洗后（默认开），代理会改写 `instructions`、`input[].content`、
-`messages[].content` 里的指纹文本；**工具名、工具参数、图片数据、用户消息一律不动**：
+打开后（默认开），按下面的方式打断指纹。**工具名、工具参数、图片数据、用户消息一律不动**：
 
 ```ini
-WB_SANITIZE=1          # 1=开（默认）, 0=关
+WB_SANITIZE=1                # 1=开（默认）, 0=关
+WB_SANITIZE_STYLE=prefix     # prefix（默认）| rename | both
 ```
 
-`/__health` 里有 `wbSanitize` 与 `wbChannelRejected`（命中渠道拦截的次数）。
+| 方式 | 做法 | 影响 |
+|---|---|---|
+| `prefix`（默认） | 只在首条 system 文本前补一个换行 | 措辞一个字不改，仅打断前缀匹配 |
+| `rename` | `TraeCode` → `CodeBuddy` | 会改变提示词里的产品名 |
+| `both` | 两者都做 | 双保险 |
+
+选 `prefix` 当默认，是因为实测网关只 trim 空格、不 trim 换行：`" You are..."` 仍被拒，
+`"\nYou are..."` 直接 200。这样既解开渠道校验，又不动用户/客户端的提示词语义。
+
+`/__health` 里有 `wbSanitize`、`wbSanitizeStyle` 与 `wbChannelRejected`（命中渠道拦截的次数）。
 两条防线是配合用的：清洗负责让请求根本不触发校验，重试负责在网关抖动时兜底。
 
 

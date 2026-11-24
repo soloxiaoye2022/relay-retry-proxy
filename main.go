@@ -107,6 +107,7 @@ func main() {
 			"wbRewritten":       wbRewriteCount(),
 			"wbRetryChannel":    cfg.wb.RetryChannel,
 			"wbSanitize":        cfg.wb.Sanitize,
+			"wbSanitizeStyle":   cfg.wb.SanitizeStyle,
 			"wbChannelRejected": st.channelReject.Load(),
 			"emptyReasoning":    st.emptyReasoning.Load(),
 			"guardEnabled":      cfg.guard.Enabled,
@@ -201,7 +202,8 @@ func parseFlags() config {
 		wbDomain   = flag.String("wb-domain", "", "覆盖 X-Domain")
 		wbPrivData = flag.String("wb-private-data", "auto", "X-Private-Data：auto|true|false")
 		wbRetryCh  = flag.Bool("wb-retry-channel", true, "上游以「渠道校验」拒绝（400 + code 11128）时自动重试")
-		wbSanitize = flag.Bool("wb-sanitize", true, "抹掉提示词里的客户端指纹（网关按 system 前缀判定渠道）")
+		wbSanitize = flag.Bool("wb-sanitize", true, "处理提示词里的客户端指纹（网关按 system 前缀判定渠道）")
+		wbSanStyle = flag.String("wb-sanitize-style", "prefix", "指纹处理方式：prefix=首条 system 前加换行（默认）| rename=改产品名 | both")
 		guardOn    = flag.Bool("empty-guard", true, "识别「只有 reasoning 没有正文」的空响应并自动重试")
 		guardWaitD = flag.Duration("empty-guard-wait", 3*time.Second, "前瞻判定最长等待时间")
 	)
@@ -309,7 +311,7 @@ func parseFlags() config {
 
 	cfg.wb = parseWorkbuddyConfig(kv, explicit, pick,
 		*wbMode, *wbRealm, *wbUA, *wbIdeVer, *wbDomain, *wbPrivData,
-		strconv.FormatBool(*wbRetryCh), strconv.FormatBool(*wbSanitize))
+		strconv.FormatBool(*wbRetryCh), strconv.FormatBool(*wbSanitize), *wbSanStyle)
 
 	cfg.guard = defaultReasoningGuard()
 	if v := pick("EMPTY_GUARD", "", explicit["empty-guard"]); v != "" {
@@ -321,8 +323,8 @@ func parseFlags() config {
 		cfg.guard.MaxWait = d
 	}
 	if cfg.wb.Mode != "" {
-		log.Printf("[wb] 身份改写已启用 mode=%s realm=%s convertPath=%v retryChannel=%v sanitize=%v ua=%q",
-			cfg.wb.Mode, cfg.wb.Realm, cfg.wb.ConverPath, cfg.wb.RetryChannel, cfg.wb.Sanitize,
+		log.Printf("[wb] 身份改写已启用 mode=%s realm=%s convertPath=%v retryChannel=%v sanitize=%v(%s) ua=%q",
+			cfg.wb.Mode, cfg.wb.Realm, cfg.wb.ConverPath, cfg.wb.RetryChannel, cfg.wb.Sanitize, cfg.wb.SanitizeStyle,
 			orDefault(cfg.wb.UpstreamUA, wbDefaultUA(cfg.wb.Realm, cfg.wb.Mode)))
 	}
 
@@ -785,7 +787,7 @@ func buildRequest(orig *http.Request, body []byte, upstream string, ctx context.
 		// 网关按「首条 system 提示词里的客户端签名」判定渠道来源，命中就把
 		// 产品名换掉，避免整条链路因为它被 400 / code 11128 拒掉。
 		if wb.Sanitize {
-			if sb, err := wbSanitizeBody(body); err == nil && len(sb) > 0 && !bytes.Equal(sb, body) {
+			if sb, err := wbSanitizeBody(body, wb.SanitizeStyle); err == nil && len(sb) > 0 && !bytes.Equal(sb, body) {
 				body = sb
 				rdr = bytes.NewReader(body)
 				req2, err2 := http.NewRequestWithContext(ctx, orig.Method, target, rdr)

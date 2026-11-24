@@ -26,16 +26,17 @@ import (
 
 // workbuddyConfig 是模式开关与身份参数，全部来自配置文件 / 命令行。
 type workbuddyConfig struct {
-	Mode         string // off | desktop | vscode | cli
-	Realm        string // cn | intl
-	UpstreamUA   string // 覆盖默认 UA（空=按身份/realm 现算）
-	IdeVersion   string // 覆盖 X-IDE-Version
-	Domain       string // 覆盖 X-Domain
-	ConverPath   bool   // 是否把 /v1/chat/completions 改写到 /v2/chat/completions
-	PrivateData  string // true | false | 空(auto)
-	APIMode      string // auto | chat | responses
-	RetryChannel bool   // 上游以「渠道校验」拒绝（400 + code 11128）时是否重试
-	Sanitize     bool   // 是否抹掉提示词里的客户端指纹（网关按首条 system 前缀判定来源）
+	Mode          string // off | desktop | vscode | cli
+	Realm         string // cn | intl
+	UpstreamUA    string // 覆盖默认 UA（空=按身份/realm 现算）
+	IdeVersion    string // 覆盖 X-IDE-Version
+	Domain        string // 覆盖 X-Domain
+	ConverPath    bool   // 是否把 /v1/chat/completions 改写到 /v2/chat/completions
+	PrivateData   string // true | false | 空(auto)
+	APIMode       string // auto | chat | responses
+	RetryChannel  bool   // 上游以「渠道校验」拒绝（400 + code 11128）时是否重试
+	Sanitize      bool   // 是否处理提示词里的客户端指纹（网关按首条 system 前缀判定来源）
+	SanitizeStyle string // prefix=只在首条 system 前加换行打断指纹（默认，不改措辞）| rename=改名 | both
 }
 
 // wbChannelRejectCodes 是上游网关「渠道校验失败」的错误码。
@@ -254,10 +255,65 @@ func wbSanitizeContent(v any) (any, bool) {
 	return v, false
 }
 
-// wbSanitizeBody 清掉 body 里会被网关当成「非官方客户端」的产品指纹。
-// 只触碰 instructions / input[].content / messages[].content，其余字段不动；
-// 没有命中指纹时原样返回，不做无意义的重编码。
-func wbSanitizeBody(body []byte) ([]byte, error) {
+// wbPrefixBreak 在首条 system 文本最前面补一个换行，打断网关的前缀指纹匹配。
+//
+// 实测：网关会 trim 掉空格但不 trim 换行 —— " You are..." 仍然被拒，
+// "\nYou are..." 直接 200。这比把产品名改掉更保守：提示词措辞一个字没变，
+// 只动了一个空白字符。
+func wbPrefixBreak(m map[string]any) bool {
+	if v, ok := m["instructions"].(string); ok && v != "" {
+		if !strings.HasPrefix(v, "\n") {
+			m["instructions"] = "\n" + v
+			return true
+		}
+	}
+	for _, key := range []string{"input", "messages"} {
+		arr, ok := m[key].([]any)
+		if !ok {
+			continue
+		}
+		for i, raw := range arr {
+			item, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if role, _ := item["role"].(string); role != "system" {
+				continue
+			}
+			switch c := item["content"].(type) {
+			case string:
+				if c != "" && !strings.HasPrefix(c, "\n") {
+					item["content"] = "\n" + c
+					arr[i] = item
+					return true
+				}
+			case []any:
+				for j, part := range c {
+					pm, ok := part.(map[string]any)
+					if !ok {
+						continue
+					}
+					txt, ok := pm["text"].(string)
+					if !ok || txt == "" || strings.HasPrefix(txt, "\n") {
+						continue
+					}
+					pm["text"] = "\n" + txt
+					c[j] = pm
+					item["content"] = c
+					arr[i] = item
+					return true
+				}
+			}
+			return false
+		}
+	}
+	return false
+}
+
+// wbSanitizeBody 处理 body 里会被网关当成「非官方客户端」的提示词指纹。
+// style：prefix（默认，只在首条 system 前加换行）/ rename（改产品名）/ both。
+// 只触碰 instructions / input[].content / messages[].content，工具与图片不动。
+func wbSanitizeBody(body []byte, style string) ([]byte, error) {
 	if len(body) == 0 {
 		return body, nil
 	}
@@ -266,33 +322,40 @@ func wbSanitizeBody(body []byte) ([]byte, error) {
 		return body, nil
 	}
 	changed := false
-	if v, ok := m["instructions"].(string); ok {
-		if nv, ch := wbSanitizeTextReport(v); ch {
-			m["instructions"] = nv
+	if style == "prefix" || style == "both" {
+		if wbPrefixBreak(m) {
 			changed = true
 		}
 	}
-	walk := func(key string) {
-		arr, ok := m[key].([]any)
-		if !ok {
-			return
-		}
-		for i, raw := range arr {
-			item, ok := raw.(map[string]any)
-			if !ok {
-				continue
+	if style == "rename" || style == "both" {
+		if v, ok := m["instructions"].(string); ok {
+			if nv, ch := wbSanitizeTextReport(v); ch {
+				m["instructions"] = nv
+				changed = true
 			}
-			if c, ok := item["content"]; ok {
-				if nc, ch := wbSanitizeContent(c); ch {
-					item["content"] = nc
-					arr[i] = item
-					changed = true
+		}
+		walk := func(key string) {
+			arr, ok := m[key].([]any)
+			if !ok {
+				return
+			}
+			for i, raw := range arr {
+				item, ok := raw.(map[string]any)
+				if !ok {
+					continue
+				}
+				if c, ok := item["content"]; ok {
+					if nc, ch := wbSanitizeContent(c); ch {
+						item["content"] = nc
+						arr[i] = item
+						changed = true
+					}
 				}
 			}
 		}
+		walk("input")
+		walk("messages")
 	}
-	walk("input")
-	walk("messages")
 	if !changed {
 		return body, nil
 	}
@@ -650,7 +713,7 @@ func parseWorkbuddyConfig(
 	kv map[string]string,
 	explicit map[string]bool,
 	pick func(key, cur string, isExplicit bool) string,
-	mode, realm, ua, ideVer, domain, privateData, retryChannel, sanitize string,
+	mode, realm, ua, ideVer, domain, privateData, retryChannel, sanitize, sanitizeStyle string,
 ) workbuddyConfig {
 	cfg := workbuddyConfig{
 		Mode:        strings.ToLower(strings.TrimSpace(pick("WB_MODE", mode, explicit["wb-mode"]))),
@@ -679,6 +742,13 @@ func parseWorkbuddyConfig(
 	cfg.RetryChannel = !(rawRetry == "0" || rawRetry == "false" || rawRetry == "off" || rawRetry == "no")
 	rawSan := strings.ToLower(strings.TrimSpace(pick("WB_SANITIZE", "1", explicit["wb-sanitize"])))
 	cfg.Sanitize = !(rawSan == "0" || rawSan == "false" || rawSan == "off" || rawSan == "no")
+	style := strings.ToLower(strings.TrimSpace(pick("WB_SANITIZE_STYLE", sanitizeStyle, explicit["wb-sanitize-style"])))
+	switch style {
+	case "prefix", "rename", "both":
+		cfg.SanitizeStyle = style
+	default:
+		cfg.SanitizeStyle = "prefix"
+	}
 	cfg.APIMode = strings.ToLower(strings.TrimSpace(pick("WB_API_MODE", "auto", explicit["wb-api-mode"])))
 	if cfg.APIMode != "chat" && cfg.APIMode != "responses" {
 		cfg.APIMode = "auto"

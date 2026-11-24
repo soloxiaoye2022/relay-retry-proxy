@@ -217,7 +217,7 @@ func TestWBSanitizeBodyReplacesFingerprint(t *testing.T) {
 		`"input":[{"type":"message","role":"system","content":[{"type":"input_text","text":"You are an interactive agent in TraeCode that helps the USER."}]},` +
 		`{"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}],` +
 		`"tools":[{"type":"function","name":"TraeCode_search","parameters":{"type":"object"}}]}`)
-	out, err := wbSanitizeBody(body)
+	out, err := wbSanitizeBody(body, "rename")
 	if err != nil {
 		t.Fatalf("清洗失败：%v", err)
 	}
@@ -239,7 +239,7 @@ func TestWBSanitizeBodyReplacesFingerprint(t *testing.T) {
 // 没有指纹时不动 body（避免无意义的重编码）。
 func TestWBSanitizeBodyNoop(t *testing.T) {
 	body := []byte(`{"model":"x","input":[{"role":"user","content":"hi"}]}`)
-	out, err := wbSanitizeBody(body)
+	out, err := wbSanitizeBody(body, "rename")
 	if err != nil {
 		t.Fatalf("清洗失败：%v", err)
 	}
@@ -271,5 +271,62 @@ func TestWBResponsesToChatKeepsTypedMessages(t *testing.T) {
 	}
 	if got.Messages[0].Role != "system" || got.Messages[1].Role != "user" {
 		t.Fatalf("角色顺序不对：%s", out)
+	}
+}
+
+func firstSystemText(t *testing.T, body []byte) string {
+	t.Helper()
+	var m struct {
+		Instructions string `json:"instructions"`
+		Input        []struct {
+			Content any `json:"content"`
+		} `json:"input"`
+	}
+	if err := json.Unmarshal(body, &m); err != nil {
+		t.Fatalf("解析失败：%v", err)
+	}
+	if m.Instructions != "" {
+		return m.Instructions
+	}
+	parts, ok := m.Input[0].Content.([]any)
+	if !ok {
+		t.Fatalf("content 不是分块结构：%v", m.Input[0].Content)
+	}
+	return parts[0].(map[string]any)["text"].(string)
+}
+
+// prefix 模式：只加一个换行打断前缀指纹，提示词措辞一个字都不改。
+func TestWBSanitizeBodyPrefixStyle(t *testing.T) {
+	const original = "You are an interactive agent in TraeCode that helps the USER."
+	body := []byte(`{"model":"m","input":[{"type":"message","role":"system","content":[{"type":"input_text","text":"` + original + `"}]},{"role":"user","content":"hi"}]}`)
+	out, err := wbSanitizeBody(body, "prefix")
+	if err != nil {
+		t.Fatalf("清洗失败：%v", err)
+	}
+	got := firstSystemText(t, out)
+	if got != "\n"+original {
+		t.Fatalf("期望只多一个换行，实际 %q", got)
+	}
+	if strings.Contains(string(out), "CodeBuddy") {
+		t.Fatalf("prefix 模式不该改产品名：%s", out)
+	}
+	// 幂等：再洗一次不能叠出第二个换行
+	out2, _ := wbSanitizeBody(out, "prefix")
+	if firstSystemText(t, out2) != "\n"+original {
+		t.Fatalf("prefix 模式不幂等：%s", out2)
+	}
+}
+
+// both 模式：换行 + 改名一起上。
+func TestWBSanitizeBodyBothStyle(t *testing.T) {
+	const original = "You are an interactive agent in TraeCode that helps the USER."
+	body := []byte(`{"model":"m","input":[{"type":"message","role":"system","content":[{"type":"input_text","text":"` + original + `"}]}]}`)
+	out, err := wbSanitizeBody(body, "both")
+	if err != nil {
+		t.Fatalf("清洗失败：%v", err)
+	}
+	got := firstSystemText(t, out)
+	if !strings.HasPrefix(got, "\n") || strings.Contains(got, "TraeCode") {
+		t.Fatalf("both 模式结果不对：%q", got)
 	}
 }

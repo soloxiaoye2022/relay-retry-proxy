@@ -82,8 +82,12 @@ New API v1.0.0-rc.49 在该模型上存在多条上游渠道，其中 WorkBuddy 
    - 未命中（普通 400，如 `input is required`）→ 把已读出的 body 放回，照常透传。
 3. 开关：`WB_RETRY_CHANNEL`（env）/ `-wb-retry-channel`（flag），默认开启。
 4. `/__health` 增加 `wbRetryChannel`、`wbChannelRejected`、`wbSanitize`。
-5. `workbuddy.go`：新增 `wbSanitizeBody`，只改写 `instructions`、
-   `input[].content`、`messages[].content` 里的指纹文本（`TraeCode` → `CodeBuddy`），
+5. `workbuddy.go`：新增 `wbSanitizeBody`，支持三种处理方式（`WB_SANITIZE_STYLE`）：
+   - `prefix`（默认）：只在首条 system 文本前补一个换行打断前缀匹配，**措辞不变**；
+     实测网关 trim 空格但不 trim 换行（`" You are..."` 仍 400，`"\nYou are..."` 200）。
+   - `rename`：把 `TraeCode` 改成中性产品名。
+   - `both`：两者都做。
+   只触碰 `instructions`、`input[].content`、`messages[].content`，
    工具名/参数/图片/用户内容不动；开关 `WB_SANITIZE`（默认开）。
 6. 顺带修复 `wbResponsesToChat` 丢掉 `type=message` 普通消息的缺陷：真实客户端
    的 system 提示词原本会被整条丢弃（WB_API_MODE=auto 时）。
