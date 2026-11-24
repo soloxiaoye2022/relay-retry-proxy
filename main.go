@@ -50,6 +50,7 @@ type config struct {
 	priceFile   string
 	logPath     string
 	maxBody     int64
+	wb          workbuddyConfig
 }
 
 type counters struct {
@@ -93,6 +94,33 @@ func main() {
 			"succeeded":   st.succeeded.Load(),
 			"failed":      st.failed.Load(),
 			"upstream5xx": atomic.LoadInt64(&st.upstream5),
+			"wbMode":      cfg.wb.Mode,
+			"wbRealm":     cfg.wb.Realm,
+			"wbRewritten": wbRewriteCount(),
+		})
+	})
+	// /__wb-headers：不发网络请求，只按当前配置构造一份出站头，
+	// 用于和中转站/官方客户端的抓包逐项对比。
+	mux.HandleFunc("/__wb-headers", func(w http.ResponseWriter, r *http.Request) {
+		if cfg.wb.Mode == "" {
+			http.Error(w, "wb mode is off", http.StatusNotFound)
+			return
+		}
+		h := http.Header{}
+		h.Set("Authorization", "Bearer "+strings.TrimSpace(r.URL.Query().Get("token")))
+		if uid := r.URL.Query().Get("uid"); uid != "" {
+			h.Set("X-User-Id", uid)
+		}
+		wbApplyHeaders(h, cfg.wb, cfg.wb.Mode, r.URL.Query().Get("model"))
+		w.Header().Set("Content-Type", "application/json; charset=utf-8")
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(map[string]any{
+			"mode":     cfg.wb.Mode,
+			"realm":    cfg.wb.Realm,
+			"endpoint": wbEndpointFor(cfg.wb.Realm, cfg.wb.Mode),
+			"path":     wbTargetPath("/v1/chat/completions", cfg.wb),
+			"headers":  h,
 		})
 	})
 	initUI(mux, func(w http.ResponseWriter, r *http.Request) {
@@ -152,6 +180,12 @@ func parseFlags() config {
 		hedgeTO    = flag.Duration("hedge-after", 8*time.Second, "首次尝试迟迟没响应时，并行再发一次（0=关闭）")
 		logPath    = flag.String("log", "", "日志文件，空则 stdout")
 		maxBodyMB  = flag.Int64("max-body-mb", 64, "请求体上限（MB）")
+		wbMode     = flag.String("wb-mode", "off", "WorkBuddy 身份改写：off|desktop|vscode|cli")
+		wbRealm    = flag.String("wb-realm", "intl", "WorkBuddy 区域：cn|intl")
+		wbUA       = flag.String("wb-ua", "", "覆盖出站 User-Agent（空=按身份自动生成）")
+		wbIdeVer   = flag.String("wb-ide-version", "", "覆盖 X-IDE-Version")
+		wbDomain   = flag.String("wb-domain", "", "覆盖 X-Domain")
+		wbPrivData = flag.String("wb-private-data", "auto", "X-Private-Data：auto|true|false")
 	)
 	flag.Parse()
 	if *tokModel != "" {
@@ -253,6 +287,15 @@ func parseFlags() config {
 		cfg.usageDir = filepath.Join(base, "usage")
 	}
 	cfg.maxBody = int64(parseInt(pick("MAX_BODY_MB", strconv.FormatInt(*maxBodyMB, 10), explicit["max-body-mb"]), 64)) << 20
+
+	cfg.wb = parseWorkbuddyConfig(kv, explicit, pick,
+		*wbMode, *wbRealm, *wbUA, *wbIdeVer, *wbDomain, *wbPrivData)
+	if cfg.wb.Mode != "" {
+		log.Printf("[wb] 身份改写已启用 mode=%s realm=%s convertPath=%v ua=%q",
+			cfg.wb.Mode, cfg.wb.Realm, cfg.wb.ConverPath,
+			orDefault(cfg.wb.UpstreamUA, wbDefaultUA(cfg.wb.Realm, cfg.wb.Mode)))
+	}
+
 	if cfg.configFile != "" {
 		log.Printf("[config] 使用配置文件 %s", cfg.configFile)
 	}
@@ -343,7 +386,7 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 			log.Printf("[%s] launching attempt %d/%d -> %s", reqID, a, cfg.maxAttempts, up)
 		}
 		go func() {
-			req, err := buildRequest(r, body, up, actx)
+			req, err := buildRequest(r, body, up, actx, cfg.wb)
 			if err != nil {
 				results <- result{a, nil, err}
 				return
@@ -605,8 +648,12 @@ func streamCopy(w http.ResponseWriter, src io.Reader, sink *dumpSink, tap *tailB
 	}
 }
 
-func buildRequest(orig *http.Request, body []byte, upstream string, ctx context.Context) (*http.Request, error) {
-	target := upstream + orig.URL.Path
+func buildRequest(orig *http.Request, body []byte, upstream string, ctx context.Context, wb workbuddyConfig) (*http.Request, error) {
+	path := orig.URL.Path
+	if wb.Mode != "" {
+		path = wbTargetPath(path, wb)
+	}
+	target := upstream + path
 	if orig.URL.RawQuery != "" {
 		target += "?" + orig.URL.RawQuery
 	}
@@ -620,6 +667,29 @@ func buildRequest(orig *http.Request, body []byte, upstream string, ctx context.
 	}
 	copyHeaders(req.Header, orig.Header)
 	req.Header.Del("Accept-Encoding")
+	req.Header.Del("Host")
+
+	// WorkBuddy 身份改写：只有对话类路径需要，其它路径（模型列表、计费等）原样透传
+	if wb.Mode != "" && wbIsChatPath(orig.URL.Path) {
+		// 先把 responses / messages 形态收敛成 chat 形态
+		if converted, proto := wbNormalizeInbound(orig.URL.Path, body, wb); proto != "" && len(converted) > 0 {
+			body = converted
+		}
+		if newBody, err := wbRewriteBody(body); err == nil && len(newBody) > 0 {
+			body = newBody
+			rdr = bytes.NewReader(body)
+			req2, err2 := http.NewRequestWithContext(ctx, orig.Method, target, rdr)
+			if err2 == nil {
+				req2.Header = req.Header
+				req = req2
+			} else {
+				req.Body = io.NopCloser(bytes.NewReader(body))
+			}
+		}
+		wbApplyHeaders(req.Header, wb, wb.Mode, extractModel(body))
+		wbRewritten.Add(1)
+	}
+
 	req.ContentLength = int64(len(body))
 	return req, nil
 }

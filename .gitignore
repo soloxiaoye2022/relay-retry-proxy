@@ -14,3 +14,10 @@
 # 工具运行时目录（gh 等）
 .config/
 .local/
+# 本机构建与联调产物
+/relay-retry-proxy.exe
+/fakeupstream.exe
+*.jsonl
+/usage/
+/cmd/fakeupstream/fakeupstream.exe
+/.go

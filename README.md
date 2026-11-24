@@ -63,6 +63,61 @@ journalctl -u relay-retry-proxy -n 50 --no-pager
 curl -s http://127.0.0.1:8443/__health
 ```
 
+## 上游渠道校验（400 / code 11128）对齐
+
+上游（WorkBuddy / CodeBuddy 网关）会按**客户端身份**校验请求来源。中转站在
+中间重打包请求时，往往把官方桌面端那套身份头丢了或换掉了，于是网关回：
+
+```json
+{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}
+```
+
+这不是账号问题、也不是 key 问题——同一个 key 发最小请求能过，客户端真实请求
+被拒，差别就在 **body 形态 + 出站头族**。本代理内置一组开关，把这两样按官方
+抓包对齐：
+
+```ini
+WB_MODE=desktop        # off | desktop | vscode | cli
+WB_REALM=intl          # cn | intl
+WB_CONVERT_PATH=1      # 入站 chat/messages/responses 统一改写到 /v2/chat/completions
+WB_API_MODE=auto       # auto | chat | responses
+```
+
+三种身份分别对应：
+
+| 身份 | 典型 UA | 浏览器头 | 说明 |
+|---|---|---|---|
+| `desktop` | `WorkBuddy/5.9.4 workbuddy-ai/5.9.4 CLI/2.165.0` | 有 Origin / Referer | 官方桌面端 |
+| `vscode` | `Visual Studio Code/4.12.39997873 …` | 有，另带 `X-Product-Version` | 官方 VSCode 扩展 |
+| `cli` | `CLI/2.168.2 CodeBuddy/2.168.2` | **无** | 官方 CodeBuddy CLI |
+
+改写做了三件事：
+
+1. **协议收敛**：`/v1/chat/completions`、`/v1/messages`（Anthropic）、
+   `/v1/responses`（OpenAI Responses）三种入站形态统一转成 chat 形态，
+   路径也改写到 `/v2/chat/completions`。
+2. **body 归一**：`developer` 角色降级为 `system`（网关不收 developer）、
+   `stream` 强制 `true` 并补 `stream_options.include_usage`、剔除网关不认的
+   字段、deepseek 系列补 `thinking` / `reasoning_effort`。
+3. **头族重建**：先清掉会暴露中转站身份的残留头（`X-Forwarded-For`、
+   `X-Stainless-*`、`X-Cloudide-Token`、`X-App-Id`、`X-Plugin-Channel` 等），
+   再按官方顺序写入 `X-Agent-*`、`X-IDE-*`、`X-Conversation-*`、`X-B3-*` 一族。
+   **`Authorization` 原样保留**——它是你的中转站 key，不会被改写。
+
+### 对照检查发出去的头
+
+不想抓包也能看当前配置会生成什么：
+
+```bash
+curl -s "http://127.0.0.1:8443/__wb-headers?token=ck_xxx&uid=123&model=glm-5.3"
+```
+
+返回当前身份、端点、改写后的路径与完整出站头，可直接和官方客户端抓包逐项比对。
+`/__health` 里也会带 `wbMode` / `wbRealm` / `wbRewritten` 计数。
+
+> 默认 `WB_MODE=off`，不打开时行为与旧版本完全一致。
+
+
 ## 部署形态
 
 ```
