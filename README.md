@@ -173,6 +173,35 @@ WB_SANITIZE_STYLE=prefix     # prefix（默认）| rename | both
 两条防线是配合用的：清洗负责让请求根本不触发校验，重试负责在网关抖动时兜底。
 
 
+## 流式保命：瘦身回显 + 静默保活
+
+Trae 的 custom model 隧道是 WebSocket（`trae-ws-cn.mchost.guru`），云端会以
+`1001 server_disconnected` 主动关闭连接；连接一断，客户端立刻取消发往代理的
+HTTP 流，整轮对话作废（客户端侧表现为 `4054 Custom model internal error`）。
+代理改不了云端的策略，但能压低两条最可疑的诱因：
+
+```ini
+STREAM_TRIM=1            # 瘦身大回显，默认开
+STREAM_KEEPALIVE=5s      # 上游静默时补注释帧，0=关
+```
+
+### 瘦身回显（`-stream-trim`）
+
+上游在 `response.created` / `response.in_progress` 里会把**整个请求**回显一遍。
+实测 22 万 token 的请求，这两个事件分别是 **54 KB 和 51 KB**，而客户端只用得到
+`id` / `model` / `status`。瘦身后单个事件几百字节，整条流的首包体积小两个数量级。
+
+只动这两个事件，其余事件（含 tool_calls 的增量）逐字节原样转发；`output` 保留为空数组。
+
+### 静默保活（`-stream-keepalive`）
+
+正文开始后如果上游长时间不吐字节，代理每 `5s` 往客户端写一个 SSE 注释帧
+`: keepalive`。按 SSE 规范注释行必须被忽略，`data:` 流不受影响。
+
+> 注意：保活只作用在**已经开始转发之后**。等上游响应头的那段时间（本次实测 12s）
+> 代理还不敢写响应头——因为那期间仍可能改判去重试。要覆盖那一段只能改成「先回 200
+> 再续流」，会牺牲重试语义，目前没做。
+
 ## 空思考守卫（empty_reasoning_only）
 
 DeepSeek 系模型偶尔会把**整轮预算全花在 reasoning 上**，思考完直接结束，正文
@@ -473,6 +502,8 @@ Windows 打包版：`relay-retry-proxy-windows.zip`
 | `-dump-body` | `false` | dump 里是否落请求体（默认不落，避免把 prompt 写到磁盘） |
 | `-usage-dir` | 空 | 用量 JSONL 目录，默认 `<日志目录>/usage` |
 | `-prices` | 空 | 模型单价文件 `prices.json` |
+| `-stream-trim` | `true` | 瘦身上游 `response.created`/`in_progress` 的大回显（去掉 tools/input） |
+| `-stream-keepalive` | `5s` | 上游静默时补 SSE 注释帧的间隔；`0` 关闭 |
 | `-empty-guard` | `true` | 识别「只有 reasoning 没有正文」的空响应并重试 |
 | `-empty-guard-wait` | `3s` | 空思考判定的最长前瞻时间 |
 | `-tokenize` | 空 | 从 stdin 读文本，按指定模型词表打印 token 数后退出 |

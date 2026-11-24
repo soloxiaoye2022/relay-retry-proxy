@@ -35,27 +35,29 @@ var headerModeCfg = "allow"
 const shutdownGrace = 150 * time.Second
 
 type config struct {
-	configFile  string
-	listen      string
-	upstreams   []string
-	maxAttempts int
-	baseDelay   time.Duration
-	maxDelay    time.Duration
-	headTimeout time.Duration
-	dialTimeout time.Duration
-	hedgeAfter  time.Duration
-	adminListen string
-	dumpDir     string
-	dumpMax     int64
-	dumpKeep    int
-	dumpBody    bool
-	usageDir    string
-	headerMode  string
-	priceFile   string
-	logPath     string
-	maxBody     int64
-	wb          workbuddyConfig
-	guard       reasoningGuardConfig
+	configFile      string
+	listen          string
+	upstreams       []string
+	maxAttempts     int
+	baseDelay       time.Duration
+	maxDelay        time.Duration
+	headTimeout     time.Duration
+	dialTimeout     time.Duration
+	hedgeAfter      time.Duration
+	adminListen     string
+	dumpDir         string
+	dumpMax         int64
+	dumpKeep        int
+	dumpBody        bool
+	usageDir        string
+	headerMode      string
+	priceFile       string
+	logPath         string
+	maxBody         int64
+	streamTrim      bool
+	streamKeepalive time.Duration
+	wb              workbuddyConfig
+	guard           reasoningGuardConfig
 }
 
 type counters struct {
@@ -112,6 +114,8 @@ func main() {
 			"wbChannelRejected": st.channelReject.Load(),
 			"emptyReasoning":    st.emptyReasoning.Load(),
 			"clientGone":        st.clientGone.Load(),
+			"streamTrim":        cfg.streamTrim,
+			"streamKeepalive":   cfg.streamKeepalive.String(),
 			"guardEnabled":      cfg.guard.Enabled,
 		})
 	})
@@ -206,6 +210,8 @@ func parseFlags() config {
 		wbRetryCh  = flag.Bool("wb-retry-channel", true, "上游以「渠道校验」拒绝（400 + code 11128）时自动重试")
 		wbSanitize = flag.Bool("wb-sanitize", true, "处理提示词里的客户端指纹（网关按 system 前缀判定渠道）")
 		wbSanStyle = flag.String("wb-sanitize-style", "prefix", "指纹处理方式：prefix=首条 system 前加换行（默认）| rename=改产品名 | both")
+		trimEcho   = flag.Bool("stream-trim", true, "瘦身上游 response.created/in_progress 的大回显（去掉 tools/input，降低隧道大帧风险）")
+		keepalive  = flag.Duration("stream-keepalive", 5*time.Second, "上游静默时补 SSE 注释帧的间隔（0=关闭）")
 		guardOn    = flag.Bool("empty-guard", true, "识别「只有 reasoning 没有正文」的空响应并自动重试")
 		guardWaitD = flag.Duration("empty-guard-wait", 3*time.Second, "前瞻判定最长等待时间")
 	)
@@ -310,6 +316,9 @@ func parseFlags() config {
 		cfg.usageDir = filepath.Join(base, "usage")
 	}
 	cfg.maxBody = int64(parseInt(pick("MAX_BODY_MB", strconv.FormatInt(*maxBodyMB, 10), explicit["max-body-mb"]), 64)) << 20
+	trimRaw := strings.ToLower(strings.TrimSpace(pick("STREAM_TRIM", strconv.FormatBool(*trimEcho), explicit["stream-trim"])))
+	cfg.streamTrim = !(trimRaw == "0" || trimRaw == "false" || trimRaw == "off" || trimRaw == "no")
+	cfg.streamKeepalive = parseDur(pick("STREAM_KEEPALIVE", keepalive.String(), explicit["stream-keepalive"]), 0)
 
 	cfg.wb = parseWorkbuddyConfig(kv, explicit, pick,
 		*wbMode, *wbRealm, *wbUA, *wbIdeVer, *wbDomain, *wbPrivData,
@@ -585,7 +594,10 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 			tap := newTailBuf(256 << 10)
 			stopMon := make(chan struct{})
 			go monitorProgress(reqID, tap, start, stopMon)
-			n, copyErr := streamCopy(w, upstreamBody, sink, tap)
+			n, copyErr := streamCopy(w, upstreamBody, sink, tap, streamOptions{
+				Trim:      cfg.streamTrim,
+				Keepalive: cfg.streamKeepalive,
+			})
 			close(stopMon)
 			_ = res.resp.Body.Close()
 			if sink != nil {
@@ -715,32 +727,107 @@ func fail(w http.ResponseWriter, reqID string, start time.Time, lastErr string, 
 }
 
 // streamCopy 边读边写，每块都 flush，保证 SSE 实时到达客户端。
-func streamCopy(w http.ResponseWriter, src io.Reader, sink *dumpSink, tap *tailBuf) (int64, error) {
+// streamOptions 控制边转发边做的两件事：瘦身大回显 + 静默保活。
+type streamOptions struct {
+	Trim      bool
+	Keepalive time.Duration
+}
+
+// streamCopy 边读边写，每块都 flush，保证 SSE 实时到达客户端。
+// 读取放在独立 goroutine 里，主循环才有机会在上游静默时补保活帧。
+func streamCopy(w http.ResponseWriter, src io.Reader, sink *dumpSink, tap *tailBuf, opt streamOptions) (int64, error) {
 	flusher, _ := w.(http.Flusher)
-	buf := make([]byte, 16*1024)
-	var total int64
-	for {
-		n, rerr := src.Read(buf)
-		if n > 0 {
-			if _, werr := w.Write(buf[:n]); werr != nil {
-				return total, werr
+
+	type chunk struct {
+		data []byte
+		err  error
+	}
+	ch := make(chan chunk, 8)
+	go func() {
+		buf := make([]byte, 16*1024)
+		for {
+			n, err := src.Read(buf)
+			if n > 0 {
+				cp := make([]byte, n)
+				copy(cp, buf[:n])
+				ch <- chunk{data: cp}
 			}
-			total += int64(n)
-			if sink != nil {
-				_, _ = sink.Write(buf[:n])
-			}
-			if tap != nil {
-				_, _ = tap.Write(buf[:n])
-			}
-			if flusher != nil {
-				flusher.Flush()
+			if err != nil {
+				ch <- chunk{err: err}
+				return
 			}
 		}
-		if rerr != nil {
-			if errors.Is(rerr, io.EOF) {
-				return total, nil
+	}()
+
+	var (
+		total    int64
+		writeErr error
+		filt     sseFilter
+	)
+	writeOut := func(b []byte) {
+		if len(b) == 0 || writeErr != nil {
+			return
+		}
+		if _, err := w.Write(b); err != nil {
+			writeErr = err
+			return
+		}
+		total += int64(len(b))
+		if flusher != nil {
+			flusher.Flush()
+		}
+	}
+
+	var keepC <-chan time.Time
+	if opt.Keepalive > 0 {
+		tk := time.NewTicker(opt.Keepalive)
+		defer tk.Stop()
+		keepC = tk.C
+	}
+	lastWrite := time.Now()
+
+	for {
+		select {
+		case c := <-ch:
+			if len(c.data) > 0 {
+				// dump 与统计仍用上游原始字节，方便事后比对
+				if sink != nil {
+					_, _ = sink.Write(c.data)
+				}
+				if tap != nil {
+					_, _ = tap.Write(c.data)
+				}
+				if opt.Trim {
+					filt.feed(c.data, writeOut)
+				} else {
+					writeOut(c.data)
+				}
+				lastWrite = time.Now()
+				if writeErr != nil {
+					return total, writeErr
+				}
 			}
-			return total, rerr
+			if c.err != nil {
+				if opt.Trim {
+					filt.flush(writeOut)
+				}
+				if writeErr != nil {
+					return total, writeErr
+				}
+				if errors.Is(c.err, io.EOF) {
+					return total, nil
+				}
+				return total, c.err
+			}
+		case <-keepC:
+			// 上游静默时补注释帧，避免中间层把空闲连接判死
+			if time.Since(lastWrite) >= opt.Keepalive {
+				writeOut(keepaliveFrame)
+				lastWrite = time.Now()
+				if writeErr != nil {
+					return total, writeErr
+				}
+			}
 		}
 	}
 }
