@@ -55,14 +55,16 @@ type config struct {
 	logPath     string
 	maxBody     int64
 	wb          workbuddyConfig
+	guard       reasoningGuardConfig
 }
 
 type counters struct {
-	total     atomic.Int64
-	retried   atomic.Int64
-	succeeded atomic.Int64
-	failed    atomic.Int64
-	upstream5 int64
+	total          atomic.Int64
+	retried        atomic.Int64
+	succeeded      atomic.Int64
+	failed         atomic.Int64
+	upstream5      int64
+	emptyReasoning atomic.Int64
 }
 
 var st counters
@@ -101,7 +103,9 @@ func main() {
 			"upstream5xx": atomic.LoadInt64(&st.upstream5),
 			"wbMode":      cfg.wb.Mode,
 			"wbRealm":     cfg.wb.Realm,
-			"wbRewritten": wbRewriteCount(),
+			"wbRewritten":  wbRewriteCount(),
+			"emptyReasoning": st.emptyReasoning.Load(),
+			"guardEnabled":   cfg.guard.Enabled,
 		})
 	})
 	// /__wb-headers：不发网络请求，只按当前配置构造一份出站头，
@@ -192,6 +196,8 @@ func parseFlags() config {
 		wbIdeVer   = flag.String("wb-ide-version", "", "覆盖 X-IDE-Version")
 		wbDomain   = flag.String("wb-domain", "", "覆盖 X-Domain")
 		wbPrivData = flag.String("wb-private-data", "auto", "X-Private-Data：auto|true|false")
+		guardOn    = flag.Bool("empty-guard", true, "识别「只有 reasoning 没有正文」的空响应并自动重试")
+		guardWaitD = flag.Duration("empty-guard-wait", 3*time.Second, "前瞻判定最长等待时间")
 	)
 	flag.Parse()
 	if *tokModel != "" {
@@ -297,6 +303,16 @@ func parseFlags() config {
 
 	cfg.wb = parseWorkbuddyConfig(kv, explicit, pick,
 		*wbMode, *wbRealm, *wbUA, *wbIdeVer, *wbDomain, *wbPrivData)
+
+	cfg.guard = defaultReasoningGuard()
+	if v := pick("EMPTY_GUARD", "", explicit["empty-guard"]); v != "" {
+		cfg.guard.Enabled = !(v == "0" || strings.EqualFold(v, "false") || strings.EqualFold(v, "off"))
+	} else {
+		cfg.guard.Enabled = *guardOn
+	}
+	if d := parseDur(pick("EMPTY_GUARD_WAIT", guardWaitD.String(), explicit["empty-guard-wait"]), 0); d > 0 {
+		cfg.guard.MaxWait = d
+	}
 	if cfg.wb.Mode != "" {
 		log.Printf("[wb] 身份改写已启用 mode=%s realm=%s convertPath=%v ua=%q",
 			cfg.wb.Mode, cfg.wb.Realm, cfg.wb.ConverPath,
@@ -489,6 +505,33 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 					c()
 				}
 			}
+
+			// 「先看后交」：写响应头之前先窥探一小段上游数据，识别「整轮烧在
+			// 思考上、没有任何正文」的空响应。命中就丢弃这次尝试并重试，避免
+			// 客户端看到一次「正常结束但模型没说话」于是停在原地等输入。
+			upstreamBody := io.Reader(res.resp.Body)
+			peek := newPeekReader(res.resp.Body)
+			guardVerdict, cached := peekVerdict(peek, cfg.guard)
+			if guardVerdict == verdictEmpty {
+				_ = res.resp.Body.Close()
+				st.emptyReasoning.Add(1)
+				lastErr = "empty_reasoning_only: upstream returned reasoning without output text"
+				if nextAttempt >= cfg.maxAttempts {
+					log.Printf("[%s] attempt %d 只有 reasoning 没有正文，已用尽尝试次数", reqID, res.attempt)
+					rec.Attempt = res.attempt
+					rec.Note = "empty_reasoning_only (耗尽尝试)"
+					// fail 内部会记 failed 计数与错误体，这里不重复累加
+					fail(w, reqID, start, lastErr, &rec)
+					return
+				}
+				st.retried.Add(1)
+				d := backoff(cfg, res.attempt)
+				log.Printf("[%s] attempt %d 只有 reasoning 没有正文 → %s 后重试", reqID, res.attempt, d)
+				scheduleRetry(d)
+				continue
+			}
+			upstreamBody = replayReader(cached, peek)
+
 			copyHeaders(w.Header(), res.resp.Header)
 			w.Header().Set("X-Proxy-Attempt", strconv.Itoa(res.attempt))
 			w.WriteHeader(res.resp.StatusCode)
@@ -496,7 +539,7 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 			tap := newTailBuf(256 << 10)
 			stopMon := make(chan struct{})
 			go monitorProgress(reqID, tap, start, stopMon)
-			n, copyErr := streamCopy(w, res.resp.Body, sink, tap)
+			n, copyErr := streamCopy(w, upstreamBody, sink, tap)
 			close(stopMon)
 			_ = res.resp.Body.Close()
 			if sink != nil {

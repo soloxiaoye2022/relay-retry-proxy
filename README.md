@@ -118,6 +118,34 @@ curl -s "http://127.0.0.1:8443/__wb-headers?token=ck_xxx&uid=123&model=glm-5.3"
 > 默认 `WB_MODE=off`，不打开时行为与旧版本完全一致。
 
 
+## 空思考守卫（empty_reasoning_only）
+
+DeepSeek 系模型偶尔会把**整轮预算全花在 reasoning 上**，思考完直接结束，正文
+一个字都不吐。如果照常按 SSE 结束返回，客户端会认为这一轮正常完成了（只是
+模型没说话），于是停在那里等你下一条输入——用户视角就是「转了半天什么都没出」。
+
+本代理会在**写响应头之前**先窥探一小段上游数据做判定：
+
+| 观察到 | 处理 |
+|---|---|
+| 有正文 / tool_calls | 正常流式透传，零额外延迟 |
+| 只有 reasoning，流已结束 | 判定 `empty_reasoning_only`，按失败走重试循环 |
+| 被 `max_tokens` 截断（`finish_reason: length`） | 不算空想，正常放行 |
+| 3 秒内没看清 | 按正常放行，不拖慢用户的正常请求 |
+
+命中的尝试会消耗一次 `MAX_ATTEMPTS`，重试成功后客户端只会看到一次完整的回答。
+全部尝试都空想时返回 502，body 里的 `error.message` 会写明是
+`empty_reasoning_only`。
+
+```ini
+EMPTY_GUARD=1        # 默认开；0 关闭
+EMPTY_GUARD_WAIT=3s  # 前瞻判定最长等待
+```
+
+`/__health` 里的 `emptyReasoning` 是累计命中次数，可用于判断该模型/该提示词
+是否经常空想（频繁命中说明 `reasoning_effort` 该降档或 `max_tokens` 该调大）。
+
+
 ## 部署形态
 
 ```
