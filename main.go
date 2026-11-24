@@ -28,6 +28,9 @@ import (
 
 const version = "1.4.0"
 
+// headerModeCfg: "allow"=只转发标准头, "pass"=全量透传
+var headerModeCfg = "allow"
+
 // shutdownGrace 与应用层一致：给在途流式请求留足时间，避免重启把用户请求打断
 const shutdownGrace = 150 * time.Second
 
@@ -47,6 +50,7 @@ type config struct {
 	dumpKeep    int
 	dumpBody    bool
 	usageDir    string
+	headerMode  string
 	priceFile   string
 	logPath     string
 	maxBody     int64
@@ -77,6 +81,7 @@ func main() {
 
 	dumpDirCfg, dumpKeepCfg = cfg.dumpDir, cfg.dumpKeep
 	priceFileCfg = cfg.priceFile
+	headerModeCfg = cfg.headerMode
 	prices.load(cfg.priceFile)
 	usageStore = newUsageStore(cfg.usageDir)
 	defer usageStore.Close()
@@ -168,6 +173,7 @@ func parseFlags() config {
 		dumpKeep   = flag.Int("dump-keep", 400, "每个方向保留的文件数")
 		dumpBody   = flag.Bool("dump-body", false, "dump 里是否包含请求体（默认 false，避免落盘 prompt）")
 		usageDir   = flag.String("usage-dir", "", "用量数据持久化目录（默认：日志目录下的 usage/）")
+		headerMode = flag.String("header-mode", "allow", "转发给上游的请求头策略：allow=只转发标准头（默认），pass=全量透传")
 		priceFile  = flag.String("prices", "", "模型单价文件 prices.json（默认：配置目录下）")
 		tokModel   = flag.String("tokenize", "", "从 stdin 读文本，按指定模型词表打印 token 数后退出（自测用）")
 		listen     = flag.String("listen", "127.0.0.1:8443", "监听地址")
@@ -269,6 +275,7 @@ func parseFlags() config {
 		cfg.dumpBody = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
 	}
 	cfg.logPath = pick("LOG", *logPath, explicit["log"])
+	cfg.headerMode = pick("HEADER_MODE", *headerMode, explicit["header-mode"])
 	cfg.usageDir = pick("USAGE_DIR", *usageDir, explicit["usage-dir"])
 	cfg.priceFile = pick("PRICES_FILE", *priceFile, explicit["prices"])
 	if cfg.priceFile == "" {
@@ -665,7 +672,11 @@ func buildRequest(orig *http.Request, body []byte, upstream string, ctx context.
 	if err != nil {
 		return nil, err
 	}
-	copyHeaders(req.Header, orig.Header)
+	if headerModeCfg == "pass" {
+		copyHeaders(req.Header, orig.Header)
+	} else {
+		copyAllowedHeaders(req.Header, orig.Header)
+	}
 	req.Header.Del("Accept-Encoding")
 	req.Header.Del("Host")
 
@@ -702,6 +713,35 @@ func copyHeaders(dst, src http.Header) {
 		for _, v := range vs {
 			dst.Add(k, v)
 		}
+	}
+}
+
+// allowedHeaders 是转发给第三方上游的白名单：只保留标准 OpenAI 兼容头。
+// 客户端私有头（如 Trae 的 Acl-Token、X-Model-Provider、X-Bridge-Transport、UA hertz）
+// 一律丢弃 —— 既是协议卫生，也避免把客户端内部凭据泄露给上游。
+var allowedHeaders = map[string]bool{
+	"Authorization":       true,
+	"Content-Type":        true,
+	"Accept":              true,
+	"Openai-Beta":         true,
+	"Openai-Organization": true,
+	"Openai-Project":      true,
+	"Idempotency-Key":     true,
+	"X-Request-Id":        true,
+}
+
+func copyAllowedHeaders(dst, src http.Header) {
+	for k, vs := range src {
+		ck := http.CanonicalHeaderKey(k)
+		if !allowedHeaders[ck] {
+			continue
+		}
+		for _, v := range vs {
+			dst.Add(k, v)
+		}
+	}
+	if dst.Get("User-Agent") == "" {
+		dst.Set("User-Agent", "relay-retry-proxy/"+version)
 	}
 }
 
