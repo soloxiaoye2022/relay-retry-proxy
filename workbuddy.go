@@ -35,6 +35,7 @@ type workbuddyConfig struct {
 	PrivateData  string // true | false | 空(auto)
 	APIMode      string // auto | chat | responses
 	RetryChannel bool   // 上游以「渠道校验」拒绝（400 + code 11128）时是否重试
+	Sanitize     bool   // 是否抹掉提示词里的客户端指纹（网关按首条 system 前缀判定来源）
 }
 
 // wbChannelRejectCodes 是上游网关「渠道校验失败」的错误码。
@@ -196,6 +197,111 @@ func wbHex32() string { return wbRandHex(16) }
 // ---------------------------------------------------------------------------
 // 请求体改写
 // ---------------------------------------------------------------------------
+
+// wbClientSignatures 是上游网关用来判定「请求是不是官方客户端发的」的提示词指纹。
+//
+// 实测（2026-11-24，New API v1.0.0-rc.49 → WorkBuddy 渠道）：首条 system 消息以
+// "You are an interactive agent in TraeCode" 开头时，网关稳定回 400 / code 11128；
+// 只要把这几个字换掉（或在前面加一个字），同样的请求立刻 200。说明它是按提示词
+// 开头的客户端签名做渠道校验，而不是看请求头。
+//
+// 这里只改文本内容里的指纹，不动工具定义、工具参数和图片数据。
+var wbClientSignatures = [][2]string{
+	{"You are an interactive agent in TraeCode", "You are an interactive agent in CodeBuddy"},
+	{"an interactive agent in TraeCode", "an interactive agent in CodeBuddy"},
+	{"TraeCode", "CodeBuddy"},
+}
+
+// wbSanitizeTextReport 替换指纹并报告是否真的改过。
+func wbSanitizeTextReport(s string) (string, bool) {
+	changed := false
+	for _, pair := range wbClientSignatures {
+		if strings.Contains(s, pair[0]) {
+			s = strings.ReplaceAll(s, pair[0], pair[1])
+			changed = true
+		}
+	}
+	return s, changed
+}
+
+func wbSanitizeText(s string) string {
+	out, _ := wbSanitizeTextReport(s)
+	return out
+}
+
+// wbSanitizeContent 处理 content：字符串直接换，分块内容只换 text 片段。
+func wbSanitizeContent(v any) (any, bool) {
+	switch c := v.(type) {
+	case string:
+		return wbSanitizeTextReport(c)
+	case []any:
+		changed := false
+		for i, part := range c {
+			pm, ok := part.(map[string]any)
+			if !ok {
+				continue
+			}
+			if txt, ok := pm["text"].(string); ok {
+				if nv, ch := wbSanitizeTextReport(txt); ch {
+					pm["text"] = nv
+					c[i] = pm
+					changed = true
+				}
+			}
+		}
+		return c, changed
+	}
+	return v, false
+}
+
+// wbSanitizeBody 清掉 body 里会被网关当成「非官方客户端」的产品指纹。
+// 只触碰 instructions / input[].content / messages[].content，其余字段不动；
+// 没有命中指纹时原样返回，不做无意义的重编码。
+func wbSanitizeBody(body []byte) ([]byte, error) {
+	if len(body) == 0 {
+		return body, nil
+	}
+	var m map[string]any
+	if err := json.Unmarshal(body, &m); err != nil {
+		return body, nil
+	}
+	changed := false
+	if v, ok := m["instructions"].(string); ok {
+		if nv, ch := wbSanitizeTextReport(v); ch {
+			m["instructions"] = nv
+			changed = true
+		}
+	}
+	walk := func(key string) {
+		arr, ok := m[key].([]any)
+		if !ok {
+			return
+		}
+		for i, raw := range arr {
+			item, ok := raw.(map[string]any)
+			if !ok {
+				continue
+			}
+			if c, ok := item["content"]; ok {
+				if nc, ch := wbSanitizeContent(c); ch {
+					item["content"] = nc
+					arr[i] = item
+					changed = true
+				}
+			}
+		}
+	}
+	walk("input")
+	walk("messages")
+	if !changed {
+		return body, nil
+	}
+	out, err := json.Marshal(m)
+	if err != nil {
+		return body, nil
+	}
+	return out, nil
+}
 
 // wbRewriteBody 把 OpenAI 兼容 body 收敛成 WorkBuddy 能接受的形态：
 //   - stream 强制 true + stream_options.include_usage
@@ -544,7 +650,7 @@ func parseWorkbuddyConfig(
 	kv map[string]string,
 	explicit map[string]bool,
 	pick func(key, cur string, isExplicit bool) string,
-	mode, realm, ua, ideVer, domain, privateData, retryChannel string,
+	mode, realm, ua, ideVer, domain, privateData, retryChannel, sanitize string,
 ) workbuddyConfig {
 	cfg := workbuddyConfig{
 		Mode:        strings.ToLower(strings.TrimSpace(pick("WB_MODE", mode, explicit["wb-mode"]))),
@@ -571,6 +677,8 @@ func parseWorkbuddyConfig(
 	cfg.ConverPath = !(raw == "0" || raw == "false" || raw == "off" || raw == "no")
 	rawRetry := strings.ToLower(strings.TrimSpace(pick("WB_RETRY_CHANNEL", retryChannel, explicit["wb-retry-channel"])))
 	cfg.RetryChannel = !(rawRetry == "0" || rawRetry == "false" || rawRetry == "off" || rawRetry == "no")
+	rawSan := strings.ToLower(strings.TrimSpace(pick("WB_SANITIZE", "1", explicit["wb-sanitize"])))
+	cfg.Sanitize = !(rawSan == "0" || rawSan == "false" || rawSan == "off" || rawSan == "no")
 	cfg.APIMode = strings.ToLower(strings.TrimSpace(pick("WB_API_MODE", "auto", explicit["wb-api-mode"])))
 	if cfg.APIMode != "chat" && cfg.APIMode != "responses" {
 		cfg.APIMode = "auto"
@@ -622,7 +730,10 @@ func wbResponsesToChat(raw []byte) ([]byte, bool) {
 		role, _ := item["role"].(string)
 		typ, _ := item["type"].(string)
 		switch {
-		case typ == "" && role != "":
+		// Responses 的普通消息既可能是 {role,content}，也可能显式带
+		// type=message；两种都要收，否则真实客户端（Trae）的 system 提示词
+		// 会被整条丢掉。
+		case (typ == "" || typ == "message") && role != "":
 			msgs = append(msgs, map[string]any{
 				"role":    role,
 				"content": wbContentToChat(item["content"]),

@@ -211,3 +211,65 @@ func TestWBChannelRejectNotConfusedWithUsageError(t *testing.T) {
 		t.Fatalf("正常体被误判成渠道错误：code=%d", code)
 	}
 }
+
+func TestWBSanitizeBodyReplacesFingerprint(t *testing.T) {
+	body := []byte(`{"model":"deepseek-v4.1-flash","instructions":"You are an interactive agent in TraeCode.",` +
+		`"input":[{"type":"message","role":"system","content":[{"type":"input_text","text":"You are an interactive agent in TraeCode that helps the USER."}]},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"继续"}]}],` +
+		`"tools":[{"type":"function","name":"TraeCode_search","parameters":{"type":"object"}}]}`)
+	out, err := wbSanitizeBody(body)
+	if err != nil {
+		t.Fatalf("清洗失败：%v", err)
+	}
+	got := string(out)
+	if strings.Contains(got, "in TraeCode") {
+		t.Fatalf("system/instructions 里的指纹没被清掉：%s", got)
+	}
+	if !strings.Contains(got, "in CodeBuddy") {
+		t.Fatalf("指纹没有被替换成中性产品名：%s", got)
+	}
+	if !strings.Contains(got, `"TraeCode_search"`) {
+		t.Fatalf("工具定义不该被改写：%s", got)
+	}
+	if !strings.Contains(got, `"继续"`) {
+		t.Fatalf("普通用户内容不该被改写：%s", got)
+	}
+}
+
+// 没有指纹时不动 body（避免无意义的重编码）。
+func TestWBSanitizeBodyNoop(t *testing.T) {
+	body := []byte(`{"model":"x","input":[{"role":"user","content":"hi"}]}`)
+	out, err := wbSanitizeBody(body)
+	if err != nil {
+		t.Fatalf("清洗失败：%v", err)
+	}
+	if string(out) != string(body) {
+		t.Fatalf("不该改写没有指纹的 body：%s", out)
+	}
+}
+
+// Responses 里显式带 type=message 的普通消息不能被丢掉（Trae 真实请求就是这种形态）。
+func TestWBResponsesToChatKeepsTypedMessages(t *testing.T) {
+	body := []byte(`{"model":"m","input":[` +
+		`{"type":"message","role":"system","content":[{"type":"input_text","text":"sys prompt"}]},` +
+		`{"type":"message","role":"user","content":[{"type":"input_text","text":"hi"}]}]}`)
+	out, ok := wbResponsesToChat(body)
+	if !ok {
+		t.Fatalf("转换失败")
+	}
+	var got struct {
+		Messages []struct {
+			Role    string `json:"role"`
+			Content any    `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(out, &got); err != nil {
+		t.Fatalf("解析转换结果失败：%v", err)
+	}
+	if len(got.Messages) != 2 {
+		t.Fatalf("期望 2 条消息，实际 %d：%s", len(got.Messages), out)
+	}
+	if got.Messages[0].Role != "system" || got.Messages[1].Role != "user" {
+		t.Fatalf("角色顺序不对：%s", out)
+	}
+}

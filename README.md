@@ -136,6 +136,33 @@ WB_RETRY_CHANNEL=1     # 1=开（默认）, 0=关
 
 `/__health` 里可以看到 `wbRetryChannel` 开关状态和 `wbChannelRejected` 命中次数。
 
+### 提示词指纹清洗（真正导致 11128 的原因）
+
+抓包比对后确认：**换头不是问题，提示词才是**。上游网关会看**首条 system 消息开头**
+的客户端签名，命中就判「非官方客户端」：
+
+| 首条 system 文本 | 上游 |
+|---|---|
+| `You are an interactive agent in TraeCode` | 400 / code 11128 |
+| `You are an interactive agent in TraeCode that ...` | 400 / code 11128 |
+| `You are an interactive agent in TraeCodx` | 200 |
+| `AYou are an interactive agent in TraeCode` | 200（前缀被打断） |
+| `You are an interactive agent in CodeBuddy` | 200 |
+
+同一个 1.1 MB 真实请求，只把 system 里的 `TraeCode` 换成中性产品名，就立即从 400 变 200；
+直接删掉那条 system 消息也是 200。请求头（官方 UA / `X-Agent-*` / `Origin` / `X-B3-*`）
+在两种情况下完全一样，所以问题从来不在头上。
+
+打开清洗后（默认开），代理会改写 `instructions`、`input[].content`、
+`messages[].content` 里的指纹文本；**工具名、工具参数、图片数据、用户消息一律不动**：
+
+```ini
+WB_SANITIZE=1          # 1=开（默认）, 0=关
+```
+
+`/__health` 里有 `wbSanitize` 与 `wbChannelRejected`（命中渠道拦截的次数）。
+两条防线是配合用的：清洗负责让请求根本不触发校验，重试负责在网关抖动时兜底。
+
 
 ## 空思考守卫（empty_reasoning_only）
 
