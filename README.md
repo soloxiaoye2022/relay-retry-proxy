@@ -117,6 +117,25 @@ curl -s "http://127.0.0.1:8443/__wb-headers?token=ck_xxx&uid=123&model=glm-5.3"
 
 > 默认 `WB_MODE=off`，不打开时行为与旧版本完全一致。
 
+### 渠道校验失败自动重试（400 / code 11128）
+
+上游网关返回的 `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`
+是**渠道侧**的判定，跟本次请求的内容、模型、token 数都无关：同一个 body 换一条渠道
+就能过，隔一段时间再打同一条渠道也可能就过了。这类 400 不应该直接甩给客户端。
+
+打开后，代理会把它当成可重试错误处理（和 5xx 同一套指数退避 + 对冲逻辑），
+用尽尝试次数才把上游原文透传给客户端：
+
+```ini
+WB_RETRY_CHANNEL=1     # 1=开（默认）, 0=关
+```
+
+识别规则：错误码 `11128` / `4028`，或消息里出现 `unapproved channel` /
+`Illegal API invocation`。普通 400（例如 `input is required` 之类的参数错误）
+不在其中，照旧原样透传，不会白白重试。
+
+`/__health` 里可以看到 `wbRetryChannel` 开关状态和 `wbChannelRejected` 命中次数。
+
 
 ## 空思考守卫（empty_reasoning_only）
 

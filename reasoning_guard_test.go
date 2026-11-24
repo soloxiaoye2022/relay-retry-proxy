@@ -182,3 +182,24 @@ func TestHasText(t *testing.T) {
 		}
 	}
 }
+
+// 放行后重放必须与原始流完全一致：缓存被 take 之后不能再被 peek 吐第二遍。
+func TestPeekReplayNoDuplicate(t *testing.T) {
+	p := newPeekReader(strings.NewReader(sseWithContent))
+	v, cached := peekVerdict(p, reasoningGuardConfig{
+		Enabled: true, MaxBytes: 256 << 10, MaxWait: time.Second,
+	})
+	if v != verdictContent {
+		t.Fatalf("期望判定为有正文，实际 %v", v)
+	}
+	out, err := io.ReadAll(replayReader(cached, p))
+	if err != nil {
+		t.Fatalf("读取重放流失败：%v", err)
+	}
+	if string(out) != sseWithContent {
+		t.Fatalf("重放内容与原始流不一致：\n got=%q\nwant=%q", out, sseWithContent)
+	}
+	if n := strings.Count(string(out), `"content":"hello"`); n != 1 {
+		t.Fatalf("正文块被重复发送 %d 次", n)
+	}
+}

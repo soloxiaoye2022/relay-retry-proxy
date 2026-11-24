@@ -65,6 +65,7 @@ type counters struct {
 	failed         atomic.Int64
 	upstream5      int64
 	emptyReasoning atomic.Int64
+	channelReject  atomic.Int64
 }
 
 var st counters
@@ -93,19 +94,21 @@ func main() {
 	mux.HandleFunc("/__health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		_ = json.NewEncoder(w).Encode(map[string]any{
-			"ok":          true,
-			"version":     version,
-			"upstreams":   cfg.upstreams,
-			"total":       st.total.Load(),
-			"retried":     st.retried.Load(),
-			"succeeded":   st.succeeded.Load(),
-			"failed":      st.failed.Load(),
-			"upstream5xx": atomic.LoadInt64(&st.upstream5),
-			"wbMode":      cfg.wb.Mode,
-			"wbRealm":     cfg.wb.Realm,
-			"wbRewritten":  wbRewriteCount(),
-			"emptyReasoning": st.emptyReasoning.Load(),
-			"guardEnabled":   cfg.guard.Enabled,
+			"ok":                true,
+			"version":           version,
+			"upstreams":         cfg.upstreams,
+			"total":             st.total.Load(),
+			"retried":           st.retried.Load(),
+			"succeeded":         st.succeeded.Load(),
+			"failed":            st.failed.Load(),
+			"upstream5xx":       atomic.LoadInt64(&st.upstream5),
+			"wbMode":            cfg.wb.Mode,
+			"wbRealm":           cfg.wb.Realm,
+			"wbRewritten":       wbRewriteCount(),
+			"wbRetryChannel":    cfg.wb.RetryChannel,
+			"wbChannelRejected": st.channelReject.Load(),
+			"emptyReasoning":    st.emptyReasoning.Load(),
+			"guardEnabled":      cfg.guard.Enabled,
 		})
 	})
 	// /__wb-headers：不发网络请求，只按当前配置构造一份出站头，
@@ -196,6 +199,7 @@ func parseFlags() config {
 		wbIdeVer   = flag.String("wb-ide-version", "", "覆盖 X-IDE-Version")
 		wbDomain   = flag.String("wb-domain", "", "覆盖 X-Domain")
 		wbPrivData = flag.String("wb-private-data", "auto", "X-Private-Data：auto|true|false")
+		wbRetryCh  = flag.Bool("wb-retry-channel", true, "上游以「渠道校验」拒绝（400 + code 11128）时自动重试")
 		guardOn    = flag.Bool("empty-guard", true, "识别「只有 reasoning 没有正文」的空响应并自动重试")
 		guardWaitD = flag.Duration("empty-guard-wait", 3*time.Second, "前瞻判定最长等待时间")
 	)
@@ -302,7 +306,8 @@ func parseFlags() config {
 	cfg.maxBody = int64(parseInt(pick("MAX_BODY_MB", strconv.FormatInt(*maxBodyMB, 10), explicit["max-body-mb"]), 64)) << 20
 
 	cfg.wb = parseWorkbuddyConfig(kv, explicit, pick,
-		*wbMode, *wbRealm, *wbUA, *wbIdeVer, *wbDomain, *wbPrivData)
+		*wbMode, *wbRealm, *wbUA, *wbIdeVer, *wbDomain, *wbPrivData,
+		strconv.FormatBool(*wbRetryCh))
 
 	cfg.guard = defaultReasoningGuard()
 	if v := pick("EMPTY_GUARD", "", explicit["empty-guard"]); v != "" {
@@ -314,8 +319,8 @@ func parseFlags() config {
 		cfg.guard.MaxWait = d
 	}
 	if cfg.wb.Mode != "" {
-		log.Printf("[wb] 身份改写已启用 mode=%s realm=%s convertPath=%v ua=%q",
-			cfg.wb.Mode, cfg.wb.Realm, cfg.wb.ConverPath,
+		log.Printf("[wb] 身份改写已启用 mode=%s realm=%s convertPath=%v retryChannel=%v ua=%q",
+			cfg.wb.Mode, cfg.wb.Realm, cfg.wb.ConverPath, cfg.wb.RetryChannel,
 			orDefault(cfg.wb.UpstreamUA, wbDefaultUA(cfg.wb.Realm, cfg.wb.Mode)))
 	}
 
@@ -494,6 +499,41 @@ func proxy(cfg config, client *http.Client, w http.ResponseWriter, r *http.Reque
 				}
 				scheduleRetry(backoff(cfg, res.attempt))
 				continue
+			}
+
+			// WorkBuddy 渠道校验拒绝（400 + code 11128/4028）：这是上游渠道侧的
+			// 判定，跟本次请求内容无关，属于典型的「换个渠道就过」——按可重试处理，
+			// 而不是把 400 直接甩给客户端。
+			if res.resp.StatusCode == http.StatusBadRequest && cfg.wb.RetryChannel {
+				head, _ := io.ReadAll(io.LimitReader(res.resp.Body, 64<<10))
+				_ = res.resp.Body.Close()
+				if code, msg := wbChannelRejectCode(head); code != 0 {
+					st.channelReject.Add(1)
+					lastErr = fmt.Sprintf("upstream channel reject code=%d: %s", code, truncate(msg, 200))
+					log.Printf("[%s] attempt %d 被上游渠道拦截（code=%d, %s）",
+						reqID, res.attempt, code, truncate(msg, 120))
+					if nextAttempt >= cfg.maxAttempts {
+						log.Printf("[%s] 渠道拦截重试 %d 次仍失败，放弃", reqID, res.attempt)
+						w.Header().Set("Content-Type", "application/json; charset=utf-8")
+						w.Header().Set("X-Proxy-Attempt", strconv.Itoa(res.attempt))
+						w.WriteHeader(res.resp.StatusCode)
+						_, _ = w.Write(head)
+						st.failed.Add(1)
+						uiHub.broadcast("usage", usageStore.Summary())
+						rec.Attempt = res.attempt
+						rec.Status = res.resp.StatusCode
+						rec.Note = fmt.Sprintf("channel reject code=%d (耗尽尝试)", code)
+						rec.Error = lastErr
+						return
+					}
+					st.retried.Add(1)
+					d := backoff(cfg, res.attempt)
+					log.Printf("[%s] 渠道拦截 → %s 后重试（已用 %d 次尝试）", reqID, d, res.attempt)
+					scheduleRetry(d)
+					continue
+				}
+				// 不是渠道问题：把已经读出来的 body 放回去，继续按正常响应透传
+				res.resp.Body = io.NopCloser(bytes.NewReader(head))
 			}
 
 			if retryTimer != nil {

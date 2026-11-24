@@ -180,3 +180,34 @@ func TestUIDFromToken(t *testing.T) {
 		t.Errorf("garbage token should yield empty, got %q", got)
 	}
 }
+
+func TestWBChannelRejectCode(t *testing.T) {
+	cases := []struct {
+		name string
+		body string
+		code int
+	}{
+		{"裸网关体", `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`, 11128},
+		{"客户端马甲码", `{"code":4028,"msg":"Request blocked"}`, 4028},
+		{"外层再包一层", `{"error":{"message":"upstream 400: {\"code\":11128,\"msg\":\"Illegal API invocation from an unapproved channel\"}"}}`, 11128},
+		{"双重转义字符串", `{"error":{"message":"{\"code\":11128,\"msg\":\"Illegal API invocation from an unapproved channel\"}"}}`, 11128},
+		{"普通参数错误", `{"error":{"message":"input is required","type":"new_api_error"}}`, 0},
+		{"空体", ``, 0},
+		{"非 JSON", `gateway timeout`, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, _ := wbChannelRejectCode([]byte(c.body))
+			if code != c.code {
+				t.Fatalf("code=%d 期望 %d（体：%s）", code, c.code, c.body)
+			}
+		})
+	}
+}
+
+// 渠道校验错误不能被当成普通响应放过去：它是可重试信号。
+func TestWBChannelRejectNotConfusedWithUsageError(t *testing.T) {
+	if code, _ := wbChannelRejectCode([]byte(`{"code":200,"msg":"ok"}`)); code != 0 {
+		t.Fatalf("正常体被误判成渠道错误：code=%d", code)
+	}
+}

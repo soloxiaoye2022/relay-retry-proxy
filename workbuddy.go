@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -25,14 +26,68 @@ import (
 
 // workbuddyConfig 是模式开关与身份参数，全部来自配置文件 / 命令行。
 type workbuddyConfig struct {
-	Mode        string // off | desktop | vscode | cli
-	Realm       string // cn | intl
-	UpstreamUA  string // 覆盖默认 UA（空=按身份/realm 现算）
-	IdeVersion  string // 覆盖 X-IDE-Version
-	Domain      string // 覆盖 X-Domain
-	ConverPath  bool   // 是否把 /v1/chat/completions 改写到 /v2/chat/completions
-	PrivateData string // true | false | 空(auto)
-	APIMode     string // auto | chat | responses
+	Mode         string // off | desktop | vscode | cli
+	Realm        string // cn | intl
+	UpstreamUA   string // 覆盖默认 UA（空=按身份/realm 现算）
+	IdeVersion   string // 覆盖 X-IDE-Version
+	Domain       string // 覆盖 X-Domain
+	ConverPath   bool   // 是否把 /v1/chat/completions 改写到 /v2/chat/completions
+	PrivateData  string // true | false | 空(auto)
+	APIMode      string // auto | chat | responses
+	RetryChannel bool   // 上游以「渠道校验」拒绝（400 + code 11128）时是否重试
+}
+
+// wbChannelRejectCodes 是上游网关「渠道校验失败」的错误码。
+// 11128 是 WorkBuddy 的原始码；4028 是客户端把它转成 SSE 错误时用的马甲。
+var wbChannelRejectCodes = map[int]bool{11128: true, 4028: true}
+
+// wbChannelRejectCode 从上游错误体里识别「渠道校验失败」。
+// 命中返回错误码与原始消息，未命中返回 0。
+//
+// 错误体有两种形态：
+//   - 裸的网关体：{"code":11128,"msg":"Illegal API invocation ..."}
+//   - 被别的层包过一层：{"error":{"message":"upstream 400: {\"code\":11128...}}"}}
+//
+// 所以先按 JSON 找 code，再用特征串兜底。
+func wbChannelRejectCode(body []byte) (int, string) {
+	trimmed := strings.TrimSpace(string(body))
+	if trimmed == "" {
+		return 0, ""
+	}
+
+	var probe struct {
+		Code  *json.Number `json:"code"`
+		Msg   string       `json:"msg"`
+		Error struct {
+			Code    *json.Number `json:"code"`
+			Message string       `json:"message"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal([]byte(trimmed), &probe); err == nil {
+		for _, c := range []*json.Number{probe.Code, probe.Error.Code} {
+			if c == nil {
+				continue
+			}
+			if n, err := c.Int64(); err == nil && wbChannelRejectCodes[int(n)] {
+				msg := probe.Msg
+				if msg == "" {
+					msg = probe.Error.Message
+				}
+				return int(n), msg
+			}
+		}
+	}
+
+	if strings.Contains(trimmed, "unapproved channel") ||
+		strings.Contains(trimmed, "Illegal API invocation") {
+		for code := range wbChannelRejectCodes {
+			if strings.Contains(trimmed, strconv.Itoa(code)) {
+				return code, "channel verification failed"
+			}
+		}
+		return 4028, "channel verification failed"
+	}
+	return 0, ""
 }
 
 // 官方客户端版本（来自 CN 5.8.3 / INTL 5.9.4 实跑与解包）
@@ -489,7 +544,7 @@ func parseWorkbuddyConfig(
 	kv map[string]string,
 	explicit map[string]bool,
 	pick func(key, cur string, isExplicit bool) string,
-	mode, realm, ua, ideVer, domain, privateData string,
+	mode, realm, ua, ideVer, domain, privateData, retryChannel string,
 ) workbuddyConfig {
 	cfg := workbuddyConfig{
 		Mode:        strings.ToLower(strings.TrimSpace(pick("WB_MODE", mode, explicit["wb-mode"]))),
@@ -514,6 +569,8 @@ func parseWorkbuddyConfig(
 	}
 	raw := strings.ToLower(strings.TrimSpace(pick("WB_CONVERT_PATH", "1", explicit["wb-convert-path"])))
 	cfg.ConverPath = !(raw == "0" || raw == "false" || raw == "off" || raw == "no")
+	rawRetry := strings.ToLower(strings.TrimSpace(pick("WB_RETRY_CHANNEL", retryChannel, explicit["wb-retry-channel"])))
+	cfg.RetryChannel = !(rawRetry == "0" || rawRetry == "false" || rawRetry == "off" || rawRetry == "no")
 	cfg.APIMode = strings.ToLower(strings.TrimSpace(pick("WB_API_MODE", "auto", explicit["wb-api-mode"])))
 	if cfg.APIMode != "chat" && cfg.APIMode != "responses" {
 		cfg.APIMode = "auto"

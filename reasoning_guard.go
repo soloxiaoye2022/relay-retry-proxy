@@ -95,11 +95,22 @@ func (p *peekReader) peekOnce(size int) bool {
 	return false
 }
 
-// buffered 返回当前已缓存内容（副本）。
+// buffered 返回当前已缓存内容（副本），不清空缓存。
 func (p *peekReader) buffered() []byte {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return append([]byte(nil), p.buf...)
+}
+
+// takeBuffered 取走缓存并从 peek 里清空。
+// 放行时必须用它：否则缓存既被当作 cached 前置，又会被 peek 自己再吐一遍，
+// 客户端就会收到重复的 SSE 块。
+func (p *peekReader) takeBuffered() []byte {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	buf := p.buf
+	p.buf = nil
+	return buf
 }
 
 // verdict 是前瞻判定的结果。
@@ -314,14 +325,14 @@ func peekVerdict(p *peekReader, cfg reasoningGuardConfig) (verdict, []byte) {
 			s = analyzeSSE(buf)
 		}
 		if v, ok := decide(s, atEOF); ok {
-			return v, buf
+			return v, p.takeBuffered()
 		}
 		if len(buf) >= cfg.MaxBytes || atEOF {
-			return verdictUnknown, buf
+			return verdictUnknown, p.takeBuffered()
 		}
 		if time.Now().After(deadline) {
 			// 超时：不拖延用户，按正常放行
-			return verdictContent, buf
+			return verdictContent, p.takeBuffered()
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
